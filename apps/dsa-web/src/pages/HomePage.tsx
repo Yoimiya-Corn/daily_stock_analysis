@@ -6,7 +6,7 @@ import { analysisApi, DuplicateTaskError } from '../api/analysis';
 import { validateStockCode } from '../utils/validation';
 import { getRecentStartDate, toDateInputValue } from '../utils/format';
 import { useAnalysisStore } from '../stores/analysisStore';
-import { ReportSummary } from '../components/report';
+import { ReportSummary, MarketRecommendations } from '../components/report';
 import { HistoryList } from '../components/history';
 import { TaskPanel } from '../components/tasks';
 import { useTaskStream } from '../hooks';
@@ -34,6 +34,7 @@ const HomePage: React.FC = () => {
   // 报告详情状态
   const [selectedReport, setSelectedReport] = useState<AnalysisReport | null>(null);
   const [isLoadingReport, setIsLoadingReport] = useState(false);
+  const reportContainerRef = useRef<HTMLElement>(null);
 
   // 任务队列状态
   const [activeTasks, setActiveTasks] = useState<TaskInfo[]>([]);
@@ -108,10 +109,27 @@ const HomePage: React.FC = () => {
         limit: pageSize,
       });
 
+      // 去重：每只股票只保留最新的记录
+      const deduplicateItems = (items: HistoryItem[]) => {
+        const stockMap = new Map<string, HistoryItem>();
+        for (const item of items) {
+          const existing = stockMap.get(item.stockCode);
+          if (!existing || new Date(item.createdAt) > new Date(existing.createdAt)) {
+            stockMap.set(item.stockCode, item);
+          }
+        }
+        const result = Array.from(stockMap.values()).sort(
+          (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+        console.log('[DEBUG] Deduplicated items:', result.map(i => `${i.stockCode}-${i.queryId}`));
+        return result;
+      };
+
       if (reset) {
-        setHistoryItems(response.items);
+        setHistoryItems(deduplicateItems(response.items));
       } else {
-        setHistoryItems(prev => [...prev, ...response.items]);
+        const combined = [...historyItems, ...response.items];
+        setHistoryItems(deduplicateItems(combined));
       }
 
       // 判断是否还有更多数据
@@ -120,8 +138,9 @@ const HomePage: React.FC = () => {
       setCurrentPage(page);
 
       // 如果需要自动选择第一条，且有数据，且当前没有选中报告
-      if (autoSelectFirst && response.items.length > 0 && !selectedReport) {
-        const firstItem = response.items[0];
+      const deduplicatedItems = reset ? deduplicateItems(response.items) : deduplicateItems([...historyItems, ...response.items]);
+      if (autoSelectFirst && deduplicatedItems.length > 0 && !selectedReport) {
+        const firstItem = deduplicatedItems[0];
         setIsLoadingReport(true);
         try {
           const report = await historyApi.getDetail(firstItem.queryId);
@@ -154,15 +173,25 @@ const HomePage: React.FC = () => {
 
   // 点击历史项加载报告
   const handleHistoryClick = async (queryId: string) => {
+    console.log('[DEBUG] Clicking history item, queryId:', queryId);
+
     // 取消当前分析请求的结果显示（通过递增 requestId）
     analysisRequestIdRef.current += 1;
 
     setIsLoadingReport(true);
+
+    // 滚动报告容器到顶部
+    if (reportContainerRef.current) {
+      reportContainerRef.current.scrollTop = 0;
+    }
+
     try {
       const report = await historyApi.getDetail(queryId);
+      console.log('[DEBUG] Loaded report for stock:', report.meta.stockCode, report.meta.stockName);
       setSelectedReport(report);
     } catch (err) {
       console.error('Failed to fetch report:', err);
+      setStoreError('加载报告失败，请重试');
     } finally {
       setIsLoadingReport(false);
     }
@@ -289,28 +318,39 @@ const HomePage: React.FC = () => {
         </div>
 
         {/* 右侧报告详情 */}
-        <section className="flex-1 overflow-y-auto pl-1">
+        <section ref={reportContainerRef} className="flex-1 overflow-y-auto pl-1">
           {isLoadingReport ? (
             <div className="flex flex-col items-center justify-center h-full">
               <div className="w-10 h-10 border-3 border-cyan/20 border-t-cyan rounded-full animate-spin" />
               <p className="mt-3 text-secondary text-sm">加载报告中...</p>
             </div>
-          ) : selectedReport ? (
-            <div className="max-w-4xl">
-              {/* 报告内容 */}
-              <ReportSummary data={selectedReport} isHistory />
-            </div>
           ) : (
-            <div className="flex flex-col items-center justify-center h-full text-center">
-              <div className="w-12 h-12 mb-3 rounded-xl bg-elevated flex items-center justify-center">
-                <svg className="w-6 h-6 text-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                </svg>
-              </div>
-              <h3 className="text-base font-medium text-white mb-1.5">开始分析</h3>
-              <p className="text-xs text-muted max-w-xs">
-                输入股票代码进行分析，或从左侧选择历史报告查看
-              </p>
+            <div className="max-w-4xl space-y-4">
+              {selectedReport ? (
+                <>
+                  {/* 报告内容 */}
+                  <ReportSummary key={selectedReport.meta.queryId} data={selectedReport} isHistory />
+                  {/* 全市场推荐（常驻） */}
+                  <MarketRecommendations />
+                </>
+              ) : (
+                <>
+                  {/* 空状态提示 */}
+                  <div className="flex flex-col items-center justify-center py-16">
+                    <div className="w-12 h-12 mb-3 rounded-xl bg-elevated flex items-center justify-center">
+                      <svg className="w-6 h-6 text-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                      </svg>
+                    </div>
+                    <h3 className="text-base font-medium text-white mb-1.5">开始分析</h3>
+                    <p className="text-xs text-muted max-w-xs">
+                      输入股票代码进行分析，或从左侧选择历史报告查看
+                    </p>
+                  </div>
+                  {/* 全市场推荐（常驻） */}
+                  <MarketRecommendations />
+                </>
+              )}
             </div>
           )}
         </section>

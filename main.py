@@ -256,6 +256,9 @@ def run_full_analysis(
             if review_result:
                 market_report = review_result
 
+        # 3. 全市场选股推荐
+        market_recommendations = pipeline.screen_market_stocks()
+
         # 输出摘要
         if results:
             logger.info("\n===== 分析结果摘要 =====")
@@ -290,7 +293,7 @@ def run_full_analysis(
 
                 # 添加个股决策仪表盘（使用 NotificationService 生成）
                 if results:
-                    dashboard_content = pipeline.notifier.generate_dashboard_report(results)
+                    dashboard_content = pipeline.notifier.generate_dashboard_report(results, market_recommendations=market_recommendations)
                     full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
 
                 # 3. 创建文档
@@ -524,16 +527,16 @@ def main() -> int:
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
-            logger.info(f"每日执行时间: {config.schedule_time}")
-            
+            logger.info(f"每日执行时间: {', '.join(config.schedule_times)}")
+
             from src.scheduler import run_with_schedule
-            
+
             def scheduled_task():
                 run_full_analysis(config, args, stock_codes)
-            
+
             run_with_schedule(
                 task=scheduled_task,
-                schedule_time=config.schedule_time,
+                schedule_times=config.schedule_times,
                 run_immediately=True  # 启动时先执行一次
             )
             return 0

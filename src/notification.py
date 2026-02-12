@@ -603,20 +603,96 @@ class NotificationService:
             return ('卖出', '🔴', '卖出')
         else:
             return ('观望', '⚪', '观望')
-    
+
+    def _generate_stock_recommendations(self, sorted_results: List[AnalysisResult]) -> Dict[str, List[Dict[str, str]]]:
+        """
+        生成股票推荐列表
+
+        根据评分、操作建议、趋势预测等指标，筛选出值得买入和观察的股票
+
+        Args:
+            sorted_results: 按评分排序的分析结果列表（高分在前）
+
+        Returns:
+            包含 'buy' 和 'watch' 两个列表的字典，每个列表包含推荐股票信息
+        """
+        buy_recommendations = []
+        watch_recommendations = []
+
+        for result in sorted_results:
+            score = result.sentiment_score
+            advice = result.operation_advice or ''
+            trend = result.trend_prediction or ''
+            decision_type = getattr(result, 'decision_type', '')
+            dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
+            core = dashboard.get('core_conclusion', {}) if dashboard else {}
+
+            # 股票名称（转义特殊字符）
+            stock_name = self._escape_md(result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}')
+
+            # 提取推荐理由（优先使用核心结论的一句话决策）
+            reason = core.get('one_sentence', '') if core else ''
+            if not reason:
+                # 备用：使用分析摘要
+                reason = result.analysis_summary or ''
+            if not reason:
+                # 再备用：使用买入理由
+                reason = getattr(result, 'buy_reason', '') or ''
+
+            # 截断过长的理由
+            if len(reason) > 100:
+                reason = reason[:97] + '...'
+
+            # 买入推荐：评分>=65 且 有买入信号
+            if score >= 65 and (
+                decision_type == 'buy' or
+                '买入' in advice or
+                '加仓' in advice or
+                '看多' in trend or
+                '多头' in trend
+            ):
+                buy_recommendations.append({
+                    'name': stock_name,
+                    'code': result.code,
+                    'score': score,
+                    'reason': reason or '技术面和消息面均显示买入信号'
+                })
+
+            # 观察推荐：评分 55-64 且 有持有/观望信号
+            elif 55 <= score < 65 and (
+                '持有' in advice or
+                '观望' in advice or
+                '震荡' in trend or
+                decision_type == 'hold'
+            ):
+                watch_recommendations.append({
+                    'name': stock_name,
+                    'code': result.code,
+                    'score': score,
+                    'reason': reason or '当前处于震荡阶段，可继续观察'
+                })
+
+        # 限制推荐数量（各取前3）
+        return {
+            'buy': buy_recommendations[:3],
+            'watch': watch_recommendations[:3]
+        }
+
     def generate_dashboard_report(
         self,
         results: List[AnalysisResult],
-        report_date: Optional[str] = None
+        report_date: Optional[str] = None,
+        market_recommendations: Optional[Dict[str, list]] = None
     ) -> str:
         """
         生成决策仪表盘格式的日报（详细版）
 
-        格式：市场概览 + 重要信息 + 核心结论 + 数据透视 + 作战计划
+        格式：市场概览 + 重要信息 + 核心结论 + 数据透视 + 作战计划 + 全市场推荐
 
         Args:
             results: 分析结果列表
             report_date: 报告日期（默认今天）
+            market_recommendations: 全市场选股推荐 {'buy': [...], 'watch': [...]}
 
         Returns:
             Markdown 格式的决策仪表盘日报
@@ -881,13 +957,76 @@ class NotificationService:
                 "---",
                 "",
             ])
-        
+
+        # === 全市场选股推荐 ===
+        mr = market_recommendations or {}
+        if mr.get('buy') or mr.get('watch'):
+            report_lines.extend([
+                "## 💡 全市场选股推荐",
+                "",
+                "> 基于全A股实时行情数据，按量价、估值、趋势等指标自动筛选",
+                "",
+            ])
+
+            # 买入推荐
+            if mr.get('buy'):
+                report_lines.extend([
+                    "### 🟢 今日值得关注（放量上涨）",
+                    "",
+                    "| 股票 | 现价 | 涨幅 | 量比 | 换手率 | PE | 市值 |",
+                    "|------|------|------|------|--------|-----|------|",
+                ])
+                for rec in mr['buy']:
+                    report_lines.append(
+                        f"| **{rec['name']}**({rec['code']}) "
+                        f"| {rec['price']:.2f} "
+                        f"| {rec['change_pct']:.1f}% "
+                        f"| {rec['volume_ratio']:.1f} "
+                        f"| {rec['turnover_rate']:.1f}% "
+                        f"| {rec['pe']:.0f} "
+                        f"| {rec['market_cap']} |"
+                    )
+                report_lines.append("")
+                for rec in mr['buy']:
+                    report_lines.append(f"- **{rec['name']}**: {rec['reason']}")
+                report_lines.append("")
+
+            # 观察推荐
+            if mr.get('watch'):
+                report_lines.extend([
+                    "### 🟡 中期趋势良好（可持续观察）",
+                    "",
+                    "| 股票 | 现价 | 今日涨幅 | 60日涨幅 | 量比 | PE | 市值 |",
+                    "|------|------|---------|---------|------|-----|------|",
+                ])
+                for rec in mr['watch']:
+                    report_lines.append(
+                        f"| **{rec['name']}**({rec['code']}) "
+                        f"| {rec['price']:.2f} "
+                        f"| {rec['change_pct']:.1f}% "
+                        f"| {rec.get('change_60d', 0):.1f}% "
+                        f"| {rec['volume_ratio']:.1f} "
+                        f"| {rec['pe']:.0f} "
+                        f"| {rec['market_cap']} |"
+                    )
+                report_lines.append("")
+                for rec in mr['watch']:
+                    report_lines.append(f"- **{rec['name']}**: {rec['reason']}")
+                report_lines.append("")
+
+            report_lines.extend([
+                "> ⚠️ 以上为量化筛选结果，仅供参考，不构成投资建议。买入前请自行做深入分析。",
+                "",
+                "---",
+                "",
+            ])
+
         # 底部（去除免责声明）
         report_lines.extend([
             "",
             f"*报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
         ])
-        
+
         return "\n".join(report_lines)
     
     def generate_wechat_dashboard(self, results: List[AnalysisResult]) -> str:

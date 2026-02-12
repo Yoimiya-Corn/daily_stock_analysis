@@ -13,6 +13,7 @@ A股自选股智能分析系统 - 核心分析流水线
 
 import logging
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import List, Dict, Any, Optional, Tuple
@@ -300,14 +301,18 @@ class StockAnalysisPipeline:
                         realtime_quote=realtime_quote,
                         chip_data=chip_data
                     )
+                    # 为每只股票生成唯一的 query_id（如果批次级 query_id 存在则作为前缀）
+                    stock_query_id = f"{self.query_id}_{code}" if self.query_id else uuid.uuid4().hex
+
                     self.db.save_analysis_history(
                         result=result,
-                        query_id=self.query_id or "",
+                        query_id=stock_query_id,
                         report_type=report_type.value,
                         news_content=news_context,
                         context_snapshot=context_snapshot,
                         save_snapshot=self.save_context_snapshot
                     )
+                    logger.debug(f"[{code}] 分析历史已保存，query_id: {stock_query_id}")
                 except Exception as e:
                     logger.warning(f"[{code}] 保存分析历史失败: {e}")
 
@@ -682,30 +687,693 @@ class StockAnalysisPipeline:
         
         # 发送通知（单股推送模式下跳过汇总推送，避免重复）
         if results and send_notification and not dry_run:
+            # 运行全市场选股
+            market_recs = self.screen_market_stocks()
             if single_stock_notify:
                 # 单股推送模式：只保存汇总报告，不再重复推送
                 logger.info("单股推送模式：跳过汇总推送，仅保存报告到本地")
-                self._send_notifications(results, skip_push=True)
+                self._send_notifications(results, skip_push=True, market_recommendations=market_recs)
             else:
-                self._send_notifications(results)
-        
+                self._send_notifications(results, market_recommendations=market_recs)
+
         return results
     
-    def _send_notifications(self, results: List[AnalysisResult], skip_push: bool = False) -> None:
+    def _calculate_technical_indicators(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        计算技术指标
+
+        Args:
+            df: K线数据（标准化格式，包含 close, high, low, volume 列）
+
+        Returns:
+            技术指标字典
+        """
+        import pandas as pd
+        import numpy as np
+
+        if df is None or df.empty or len(df) < 20:
+            return None
+
+        # 确保按日期排序（从旧到新）
+        df = df.sort_values('date').reset_index(drop=True)
+
+        close = df['close'].values
+        high = df['high'].values
+        low = df['low'].values
+        volume = df['volume'].values
+
+        # 计算移动平均线
+        ma5 = pd.Series(close).rolling(5).mean().iloc[-1] if len(close) >= 5 else np.nan
+        ma10 = pd.Series(close).rolling(10).mean().iloc[-1] if len(close) >= 10 else np.nan
+        ma20 = pd.Series(close).rolling(20).mean().iloc[-1] if len(close) >= 20 else np.nan
+        ma60 = pd.Series(close).rolling(60).mean().iloc[-1] if len(close) >= 60 else np.nan
+
+        # 均线多头排列检查
+        ma_bullish = False
+        if not np.isnan(ma5) and not np.isnan(ma10) and not np.isnan(ma20):
+            ma_bullish = (ma5 > ma10 > ma20)
+
+        # 创20日新高检查
+        is_20day_high = False
+        if len(high) >= 20:
+            is_20day_high = (close[-1] >= np.max(high[-20:-1]))
+
+        # 前3日缩量整理检查（量能整理）
+        is_volume_consolidated = False
+        if len(volume) >= 5:
+            recent_3d_avg = np.mean(volume[-3:])
+            prev_2d_avg = np.mean(volume[-5:-3])
+            is_volume_consolidated = (recent_3d_avg < prev_2d_avg * 0.7) if prev_2d_avg > 0 else False
+
+        # 计算RSI(14)
+        rsi = np.nan
+        if len(close) >= 15:
+            delta = pd.Series(close).diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            rsi = (100 - (100 / (1 + rs))).iloc[-1]
+
+        # 计算MACD
+        macd_golden_cross = False
+        macd_histogram = 0
+        if len(close) >= 26:
+            ema12 = pd.Series(close).ewm(span=12, adjust=False).mean()
+            ema26 = pd.Series(close).ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            signal_line = macd_line.ewm(span=9, adjust=False).mean()
+            macd_hist = macd_line - signal_line
+
+            macd_histogram = macd_hist.iloc[-1]
+            # 金叉：MACD线上穿信号线
+            if len(macd_hist) >= 2:
+                macd_golden_cross = (macd_hist.iloc[-2] < 0 and macd_hist.iloc[-1] > 0)
+
+        # 计算20日涨幅
+        gain_20d = 0
+        if len(close) >= 20:
+            gain_20d = (close[-1] / close[-20] - 1) * 100
+
+        # 计算波动率（20日标准差/均值）
+        volatility = 0
+        if len(close) >= 20:
+            volatility = pd.Series(close[-20:]).std() / pd.Series(close[-20:]).mean()
+
+        return {
+            'ma5': ma5,
+            'ma10': ma10,
+            'ma20': ma20,
+            'ma60': ma60,
+            'ma_bullish': ma_bullish,
+            'is_20day_high': is_20day_high,
+            'is_volume_consolidated': is_volume_consolidated,
+            'rsi': rsi,
+            'macd_golden_cross': macd_golden_cross,
+            'macd_histogram': macd_histogram,
+            'gain_20d': gain_20d,
+            'volatility': volatility,
+        }
+
+    def _calculate_full_score(
+        self,
+        indicators: Dict[str, Any],
+        volume_ratio: float,
+        pe: float,
+        market_cap: float,
+        change_pct: float
+    ) -> float:
+        """
+        计算完整评分（趋势突破+资金共振策略）
+
+        评分体系（总分100）：
+        - 趋势强度分(40): 20日涨幅(15) + 均线多头(10) + RSI(8) + MACD(7)
+        - 量价配合分(35): 量比(16) + 突破强度(10) + 涨幅动能(9)
+        - 安全边际分(25): 估值(10) + 市值(8) + 波动率(7)
+
+        Args:
+            indicators: 技术指标字典
+            volume_ratio: 量比
+            pe: 市盈率
+            market_cap: 总市值（亿）
+            change_pct: 今日涨幅
+
+        Returns:
+            综合评分
+        """
+        score = 0
+
+        # === 趋势强度分(40分) ===
+        # 1. 20日涨幅排名分(0-15分)：涨幅越高分越高
+        gain_20d = indicators.get('gain_20d', 0)
+        if gain_20d > 30:
+            score += 15
+        elif gain_20d > 20:
+            score += 12
+        elif gain_20d > 10:
+            score += 8
+        elif gain_20d > 5:
+            score += 5
+        elif gain_20d > 0:
+            score += 2
+
+        # 2. 均线多头质量(0-10分)
+        if indicators.get('ma_bullish', False):
+            score += 10
+        elif indicators.get('ma5', 0) > indicators.get('ma10', 0):
+            score += 5
+
+        # 3. RSI(14) 在50-70区间(0-8分)：强势但不超买
+        rsi = indicators.get('rsi', 0)
+        if 50 <= rsi <= 70:
+            score += 8
+        elif 45 <= rsi < 50 or 70 < rsi <= 75:
+            score += 5
+        elif 40 <= rsi < 45:
+            score += 3
+
+        # 4. MACD金叉/红柱(0-7分)
+        if indicators.get('macd_golden_cross', False):
+            score += 7
+        elif indicators.get('macd_histogram', 0) > 0:
+            score += 4
+
+        # === 量价配合分(35分) ===
+        # 5. 量比×8 (0-16分)：量比2.0得16分
+        score += min(volume_ratio * 8, 16)
+
+        # 6. 突破强度(0-10分)
+        if indicators.get('is_20day_high', False):
+            score += 10
+        elif change_pct > 3:
+            score += 6
+        elif change_pct > 1:
+            score += 3
+
+        # 7. 涨幅动能(0-9分)：今日涨幅适中得分
+        if 0.5 <= change_pct <= 5:
+            score += 9
+        elif 0 <= change_pct < 0.5 or 5 < change_pct <= 7:
+            score += 5
+
+        # === 安全边际分(25分) ===
+        # 8. 估值分位(0-10分)：PE越低分越高
+        if 0 < pe <= 20:
+            score += 10
+        elif 20 < pe <= 30:
+            score += 8
+        elif 30 < pe <= 40:
+            score += 5
+        elif 40 < pe <= 60:
+            score += 3
+
+        # 9. 市值稳定性(0-8分)：100-500亿最优
+        mv_yi = market_cap / 100_000_000 if market_cap > 0 else 0
+        if 100 <= mv_yi <= 500:
+            score += 8
+        elif 50 <= mv_yi < 100 or 500 < mv_yi <= 1000:
+            score += 5
+        elif mv_yi > 1000:
+            score += 3
+
+        # 10. 波动率控制(0-7分)：低波动加分
+        volatility = indicators.get('volatility', 0)
+        if volatility < 0.02:
+            score += 7
+        elif volatility < 0.03:
+            score += 5
+        elif volatility < 0.05:
+            score += 3
+
+        return score
+
+    def screen_market_stocks(self) -> Dict[str, list]:
+        """
+        从全市场A股中筛选推荐股票（完整版：趋势突破+资金共振策略）
+
+        策略核心：两阶段筛选
+        - 第一阶段：实时数据快速过滤，获取候选池（~100-200只）
+        - 第二阶段：获取历史K线，计算技术指标，综合评分
+
+        技术指标：
+        - 均线多头排列：MA5 > MA10 > MA20 > MA60
+        - 创20日新高：突破前期高点
+        - 前3日缩量整理：量能整理，蓄势待发
+        - MACD金叉：趋势确认
+        - RSI 50-70：强势但不超买
+
+        Returns:
+            {'buy': [...], 'watch': [...]} 各最多5只
+        """
+        try:
+            import pandas as pd
+            from data_provider.akshare_fetcher import _realtime_cache
+            import time as _time
+
+            logger.info("开始全市场A股筛选（完整版：趋势突破+资金共振策略）...")
+            logger.info("采用两阶段筛选：第一阶段实时数据快速过滤 → 第二阶段历史K线技术分析")
+
+            # ========== 第一阶段：获取全市场实时数据 ==========
+            current_time = _time.time()
+            df = None
+            if (_realtime_cache['data'] is not None and
+                not _realtime_cache['data'].empty and
+                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+                df = _realtime_cache['data']
+                logger.info(f"[第一阶段] 使用缓存数据，共 {len(df)} 只股票")
+            else:
+                # 缓存过期，重新拉取（带重试和降级）
+                import akshare as ak
+                logger.info("[全市场筛选] 缓存过期，重新拉取全市场数据...")
+                for attempt in range(3):
+                    try:
+                        if attempt > 0:
+                            _time.sleep(5 * attempt)
+                            logger.info(f"[全市场筛选] 第 {attempt + 1} 次重试...")
+                        df = ak.stock_zh_a_spot_em()
+                        if df is not None and not df.empty:
+                            _realtime_cache['data'] = df
+                            _realtime_cache['timestamp'] = current_time
+                            logger.info(f"[全市场筛选] 东财接口拉取成功，共 {len(df)} 只股票")
+                            break
+                    except Exception as fetch_err:
+                        logger.warning(f"[全市场筛选] 东财接口第 {attempt + 1} 次失败: {fetch_err}")
+                        df = None
+
+                # 东财接口全部失败，优先尝试 baostock+pytdx（TCP直连）
+                if df is None or df.empty:
+                    logger.info("[全市场筛选] 东财接口不可用，尝试 baostock+pytdx TCP直连...")
+                    try:
+                        import baostock as _bs
+                        from pytdx.hq import TdxHq_API as _TdxHqAPI
+
+                        # baostock 获取完整A股列表
+                        import time as _time
+                        _lg = _bs.login()
+                        _stock_list = []
+                        for _day_offset in range(0, 10):
+                            _query_date = _time.strftime('%Y-%m-%d', _time.localtime(_time.time() - _day_offset * 86400))
+                            _rs = _bs.query_all_stock(day=_query_date)
+                            _temp_list = []
+                            while _rs.error_code == '0' and _rs.next():
+                                _temp_list.append(_rs.get_row_data())
+                            if len(_temp_list) > 100:
+                                _stock_list = _temp_list
+                                logger.info(f"[全市场筛选] baostock 使用日期 {_query_date}, 获取 {len(_stock_list)} 只股票")
+                                break
+                        _bs.logout()
+
+                        _a_shares = []
+                        for _row in _stock_list:
+                            _code_full, _trade_status, _name = _row[0], _row[1], _row[2]
+                            if _trade_status != '1':
+                                continue
+                            _parts = _code_full.split('.')
+                            if len(_parts) != 2:
+                                continue
+                            _mkt, _num = _parts
+                            if _mkt == 'sh' and (_num.startswith('60') or _num.startswith('68')):
+                                _a_shares.append((1, _num, _name))
+                            elif _mkt == 'sz' and (_num.startswith('00') or _num.startswith('30')):
+                                _a_shares.append((0, _num, _name))
+
+                        logger.info(f"[全市场筛选] baostock 获取A股列表: {len(_a_shares)} 只")
+
+                        # pytdx 批量获取行情
+                        _tdx = _TdxHqAPI()
+                        _connected = False
+                        for _host in ['218.75.126.9', '115.238.56.198', '124.160.88.183',
+                                      '60.12.136.250', '218.108.98.244', '180.153.18.170']:
+                            try:
+                                if _tdx.connect(_host, 7709, time_out=10):
+                                    _connected = True
+                                    break
+                            except Exception:
+                                continue
+
+                        if _connected and _a_shares:
+                            _names_map = {(_m, _c): _n for _m, _c, _n in _a_shares}
+                            _all_quotes = []
+                            for _i in range(0, len(_a_shares), 80):
+                                _batch = _a_shares[_i:_i+80]
+                                _codes = [(_m, _c) for _m, _c, _ in _batch]
+                                try:
+                                    _data = _tdx.get_security_quotes(_codes)
+                                    if _data:
+                                        _all_quotes.extend(_data)
+                                except Exception:
+                                    continue
+                            _tdx.disconnect()
+
+                            # 转为 DataFrame
+                            _rows = []
+                            for _idx, _q in enumerate(_all_quotes):
+                                _lc = _q['last_close']
+                                _pr = _q['price']
+                                # 打印前 5 条原始数据用于调试
+                                if _idx < 5:
+                                    logger.info(f"[全市场筛选] 样本数据 {_idx+1}: code={_q.get('code')}, price={_pr}, last_close={_lc}")
+                                if _lc <= 0 or _pr <= 0:
+                                    continue
+                                _pct = (_pr - _lc) / _lc * 100
+                                _rows.append({
+                                    '代码': _q['code'],
+                                    '名称': _names_map.get((_q['market'], _q['code']), ''),
+                                    '最新价': _pr,
+                                    '涨跌幅': round(_pct, 2),
+                                    '成交量': _q['vol'],
+                                    '成交额': _q['amount'],
+                                })
+
+                            logger.info(f"[全市场筛选] pytdx获取 {len(_all_quotes)} 条行情, 有效 {len(_rows)} 条")
+                            if _rows:
+                                df = pd.DataFrame(_rows)
+                                _realtime_cache['data'] = df
+                                _realtime_cache['timestamp'] = current_time
+                                logger.info(f"[全市场筛选] baostock+pytdx 降级成功，共 {len(df)} 只股票")
+                        else:
+                            if not _connected:
+                                logger.warning("[全市场筛选] pytdx 无法连接任何服务器")
+                    except Exception as tcp_err:
+                        logger.warning(f"[全市场筛选] baostock+pytdx 降级失败: {tcp_err}")
+
+                # baostock+pytdx 也失败，尝试 efinance
+                if df is None or df.empty:
+                    logger.info("[全市场筛选] 尝试 efinance 降级...")
+                    try:
+                        import efinance as ef
+                        df = ef.stock.get_realtime_quotes()
+                        if df is not None and not df.empty:
+                            logger.info(f"[全市场筛选] efinance 原始列: {list(df.columns)}")
+                            ef_col_map = {
+                                '股票代码': '代码', '股票名称': '名称',
+                                '市盈率': '市盈率-动态',
+                            }
+                            existing_map = {k: v for k, v in ef_col_map.items() if k in df.columns}
+                            df = df.rename(columns=existing_map)
+                            if '60日涨跌幅' not in df.columns:
+                                df['60日涨跌幅'] = 0.0
+                            _realtime_cache['data'] = df
+                            _realtime_cache['timestamp'] = current_time
+                            logger.info(f"[全市场筛选] efinance 降级成功，共 {len(df)} 只股票")
+                    except Exception as ef_err:
+                        logger.warning(f"[全市场筛选] efinance 也失败: {ef_err}")
+
+                # 最后尝试新浪接口
+                if df is None or df.empty:
+                    logger.info("[全市场筛选] 尝试新浪接口降级...")
+                    try:
+                        df = ak.stock_zh_a_spot()
+                        if df is not None and not df.empty:
+                            logger.info(f"[全市场筛选] 新浪原始列: {list(df.columns)}")
+                            col_map = {
+                                'symbol': '代码', 'code': '代码',
+                                'name': '名称',
+                                'trade': '最新价', 'close': '最新价',
+                                'changepercent': '涨跌幅',
+                                'volume': '成交量', 'amount': '成交额',
+                                'turnoverratio': '换手率',
+                                'per': '市盈率-动态', 'pb': '市净率',
+                                'mktcap': '总市值', 'nmc': '流通市值',
+                            }
+                            existing_map = {k: v for k, v in col_map.items() if k in df.columns}
+                            df = df.rename(columns=existing_map)
+                            if '量比' not in df.columns:
+                                df['量比'] = 1.0
+                            if '60日涨跌幅' not in df.columns:
+                                df['60日涨跌幅'] = 0.0
+                            if '总市值' in df.columns:
+                                df['总市值'] = pd.to_numeric(df['总市值'], errors='coerce') * 10000
+                            if '流通市值' in df.columns:
+                                df['流通市值'] = pd.to_numeric(df['流通市值'], errors='coerce') * 10000
+                            _realtime_cache['data'] = df
+                            _realtime_cache['timestamp'] = current_time
+                            logger.info(f"[全市场筛选] 新浪接口降级成功，共 {len(df)} 只股票")
+                    except Exception as sina_err:
+                        logger.warning(f"[全市场筛选] 新浪接口也失败: {sina_err}")
+
+            if df is None or df.empty:
+                logger.warning("[第一阶段] 无法获取A股行情数据")
+                return {'buy': [], 'watch': []}
+
+            # 数值列转换（处理可能的百分号字符串如 "2.50%"）
+            numeric_cols = ['涨跌幅', '量比', '换手率', '市盈率-动态', '市净率',
+                           '总市值', '流通市值', '60日涨跌幅', '最新价', '成交额']
+            for col in numeric_cols:
+                if col in df.columns:
+                    if df[col].dtype == object:
+                        df[col] = df[col].astype(str).str.replace('%', '', regex=False).str.replace(',', '', regex=False)
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            logger.info(f"[第一阶段] 数据列: {list(df.columns)}")
+
+            # 基础过滤：去除ST、退市、停牌、低价股、涨停
+            base_mask = (
+                ~df['名称'].str.contains('ST|退|停|N ', na=False) &
+                (df['最新价'] > 5) &
+                (df['成交额'] > 0) &
+                (df['涨跌幅'] < 9.5)
+            )
+            df_filtered = df[base_mask].copy()
+            logger.info(f"[第一阶段] 基础过滤后剩余 {len(df_filtered)} 只")
+
+            # 一阶段快速过滤：筛选候选池（目标约100-200只）
+            candidate_mask = (
+                (df_filtered['涨跌幅'] >= -2) &  # 近期走势不太差
+                (df_filtered['涨跌幅'] <= 7) &   # 不追涨幅过大
+                (df_filtered['成交额'] > 100_000_000)  # 基本流动性
+            )
+
+            # 量比条件（有一定资金关注）
+            if '量比' in df_filtered.columns and df_filtered['量比'].sum() > 0:
+                candidate_mask = candidate_mask & (df_filtered['量比'] >= 1.2)
+
+            # 市值条件（大中盘为主）
+            if '总市值' in df_filtered.columns:
+                candidate_mask = candidate_mask & (df_filtered['总市值'] > 5_000_000_000)
+
+            # 估值条件（合理估值）
+            if '市盈率-动态' in df_filtered.columns:
+                candidate_mask = candidate_mask & (df_filtered['市盈率-动态'] > 0) & (df_filtered['市盈率-动态'] < 80)
+
+            candidates_df = df_filtered[candidate_mask].copy()
+            logger.info(f"[第一阶段] 候选池筛选完成：{len(candidates_df)} 只股票")
+
+            if candidates_df.empty:
+                logger.warning("[第一阶段] 候选池为空，无法进入第二阶段")
+                return {'buy': [], 'watch': []}
+
+            # 限制候选池大小（避免第二阶段耗时过长）
+            max_candidates = 150
+            if len(candidates_df) > max_candidates:
+                # 按量比×涨跌幅排序，取前150
+                candidates_df['_quick_score'] = candidates_df.get('量比', 1.5) * (candidates_df['涨跌幅'] + 5)
+                candidates_df = candidates_df.sort_values('_quick_score', ascending=False).head(max_candidates)
+                logger.info(f"[第一阶段] 候选池过大，按快速评分取前 {max_candidates} 只")
+
+            # ========== 第二阶段：历史K线技术分析 ==========
+            logger.info(f"[第二阶段] 开始为 {len(candidates_df)} 只候选股票获取历史K线数据...")
+            logger.info("[第二阶段] 该阶段将耗时1-2分钟，请耐心等待...")
+
+            scored_stocks = []
+            fetch_success_count = 0
+            fetch_fail_count = 0
+
+            for idx, (_, row) in enumerate(candidates_df.iterrows(), 1):
+                code = str(row['代码'])
+                name = str(row['名称'])
+
+                # 每处理10只股票输出一次进度
+                if idx % 10 == 0:
+                    logger.info(f"[第二阶段] 进度: {idx}/{len(candidates_df)} ({idx*100//len(candidates_df)}%)")
+
+                try:
+                    # 获取60日K线数据
+                    kline_df, source = self.fetcher_manager.get_daily_data(code, days=60)
+
+                    if kline_df is None or kline_df.empty or len(kline_df) < 20:
+                        logger.debug(f"[{code}] K线数据不足，跳过")
+                        fetch_fail_count += 1
+                        continue
+
+                    # 计算技术指标
+                    indicators = self._calculate_technical_indicators(kline_df)
+
+                    if indicators is None:
+                        logger.debug(f"[{code}] 技术指标计算失败，跳过")
+                        fetch_fail_count += 1
+                        continue
+
+                    # 计算完整评分
+                    score = self._calculate_full_score(
+                        indicators=indicators,
+                        volume_ratio=row.get('量比', 1.5),
+                        pe=row.get('市盈率-动态', 50),
+                        market_cap=row.get('总市值', 0),
+                        change_pct=row.get('涨跌幅', 0)
+                    )
+
+                    scored_stocks.append({
+                        'code': code,
+                        'name': name,
+                        'price': float(row.get('最新价', 0)),
+                        'change_pct': float(row.get('涨跌幅', 0)),
+                        'volume_ratio': float(row.get('量比', 0)),
+                        'turnover_rate': float(row.get('换手率', 0)),
+                        'pe': float(row.get('市盈率-动态', 0)),
+                        'market_cap': row.get('总市值', 0),
+                        'score': score,
+                        'indicators': indicators,
+                    })
+
+                    fetch_success_count += 1
+
+                except Exception as e:
+                    logger.debug(f"[{code}] 获取K线数据失败: {e}")
+                    fetch_fail_count += 1
+                    continue
+
+            logger.info(f"[第二阶段] K线数据获取完成：成功 {fetch_success_count} 只，失败 {fetch_fail_count} 只")
+
+            if not scored_stocks:
+                logger.warning("[第二阶段] 所有候选股票K线数据获取失败")
+                return {'buy': [], 'watch': []}
+
+            # 按评分排序
+            scored_stocks.sort(key=lambda x: x['score'], reverse=True)
+            logger.info(f"[第二阶段] 综合评分完成，最高分: {scored_stocks[0]['score']:.1f}，最低分: {scored_stocks[-1]['score']:.1f}")
+
+            # === 买入推荐：高分股票 + 符合买入条件 ===
+            buy_candidates = []
+            for stock in scored_stocks:
+                # 买入条件：涨幅0.5-5%（温和启动）+ 高评分
+                if 0.5 <= stock['change_pct'] <= 5.0 and stock['score'] >= 40:
+                    buy_candidates.append(stock)
+
+            buy_candidates = buy_candidates[:5]  # 最多5只
+            logger.info(f"[最终结果] 买入推荐: {len(buy_candidates)} 只")
+
+            # === 观察推荐：次高分股票 或 稳健上涨 ===
+            watch_candidates = []
+            buy_codes = {s['code'] for s in buy_candidates}
+
+            for stock in scored_stocks:
+                # 排除已在买入列表中的
+                if stock['code'] in buy_codes:
+                    continue
+
+                # 观察条件：评分不错（>30分） + 涨幅温和（-2% ~ 3%）
+                if -2 <= stock['change_pct'] <= 3 and stock['score'] >= 30:
+                    watch_candidates.append(stock)
+
+            watch_candidates = watch_candidates[:5]  # 最多5只
+            logger.info(f"[最终结果] 观察推荐: {len(watch_candidates)} 只")
+
+            # === 格式化推荐理由 ===
+            def format_reason(stock: Dict[str, Any]) -> str:
+                """生成推荐理由"""
+                indicators = stock['indicators']
+                parts = []
+
+                # 今日涨跌
+                parts.append(f"今日{'涨' if stock['change_pct'] >= 0 else '跌'}{abs(stock['change_pct']):.1f}%")
+
+                # 量价配合
+                if stock['volume_ratio'] > 0:
+                    vr_desc = "明显放量" if stock['volume_ratio'] >= 2.0 else "放量" if stock['volume_ratio'] >= 1.5 else "量比正常"
+                    parts.append(f"量比{stock['volume_ratio']:.1f}（{vr_desc}）")
+
+                # 趋势状态
+                if indicators.get('ma_bullish', False):
+                    parts.append("均线多头排列")
+                elif indicators.get('ma5', 0) > indicators.get('ma10', 0):
+                    parts.append("短期趋势向上")
+
+                # 突破信号
+                if indicators.get('is_20day_high', False):
+                    parts.append("创20日新高")
+
+                # MACD
+                if indicators.get('macd_golden_cross', False):
+                    parts.append("MACD金叉")
+
+                # RSI
+                rsi = indicators.get('rsi', 0)
+                if 50 <= rsi <= 70:
+                    parts.append(f"RSI {rsi:.0f}（强势）")
+
+                # 20日涨幅
+                gain_20d = indicators.get('gain_20d', 0)
+                if gain_20d > 10:
+                    parts.append(f"20日涨{gain_20d:.1f}%")
+
+                # 估值
+                if stock['pe'] > 0:
+                    parts.append(f"PE {stock['pe']:.0f}")
+
+                # 市值
+                mv_yi = stock['market_cap'] / 100_000_000 if stock['market_cap'] > 0 else 0
+                if mv_yi > 0:
+                    parts.append(f"市值{mv_yi:.0f}亿")
+
+                # 综合评分
+                parts.append(f"综合评分{stock['score']:.0f}")
+
+                return '，'.join(parts)
+
+            # === 转换为API格式 ===
+            buy_recs = []
+            for stock in buy_candidates:
+                mv_yi = stock['market_cap'] / 100_000_000 if stock['market_cap'] > 0 else 0
+                buy_recs.append({
+                    'name': stock['name'],
+                    'code': stock['code'],
+                    'price': stock['price'],
+                    'change_pct': stock['change_pct'],
+                    'volume_ratio': stock['volume_ratio'],
+                    'turnover_rate': stock['turnover_rate'],
+                    'pe': stock['pe'],
+                    'market_cap': f"{mv_yi:.0f}亿" if mv_yi > 0 else "N/A",
+                    'reason': format_reason(stock)
+                })
+
+            watch_recs = []
+            for stock in watch_candidates:
+                mv_yi = stock['market_cap'] / 100_000_000 if stock['market_cap'] > 0 else 0
+                watch_recs.append({
+                    'name': stock['name'],
+                    'code': stock['code'],
+                    'price': stock['price'],
+                    'change_pct': stock['change_pct'],
+                    'volume_ratio': stock['volume_ratio'],
+                    'turnover_rate': stock['turnover_rate'],
+                    'pe': stock['pe'],
+                    'market_cap': f"{mv_yi:.0f}亿" if mv_yi > 0 else "N/A",
+                    'reason': format_reason(stock)
+                })
+
+            logger.info(f"[全市场筛选完成] 买入推荐 {len(buy_recs)} 只，观察推荐 {len(watch_recs)} 只")
+            return {'buy': buy_recs, 'watch': watch_recs}
+
+        except Exception as e:
+            logger.error(f"全市场选股失败: {e}", exc_info=True)
+            return {'buy': [], 'watch': []}
+
+    def _send_notifications(self, results: List[AnalysisResult], skip_push: bool = False, market_recommendations: Optional[Dict] = None) -> None:
         """
         发送分析结果通知
-        
+
         生成决策仪表盘格式的报告
-        
+
         Args:
             results: 分析结果列表
             skip_push: 是否跳过推送（仅保存到本地，用于单股推送模式）
+            market_recommendations: 全市场选股推荐
         """
         try:
             logger.info("生成决策仪表盘日报...")
-            
+
             # 生成决策仪表盘格式的详细日报
-            report = self.notifier.generate_dashboard_report(results)
+            report = self.notifier.generate_dashboard_report(results, market_recommendations=market_recommendations)
             
             # 保存到本地
             filepath = self.notifier.save_report_to_file(report)

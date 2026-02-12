@@ -6,9 +6,11 @@ A股自选股智能分析系统 - 搜索服务模块
 
 职责：
 1. 提供统一的新闻搜索接口
-2. 支持 Tavily 和 SerpAPI 两种搜索引擎
+2. 当前仅使用 SerpAPI（Google 搜索）
 3. 多 Key 负载均衡和故障转移
 4. 搜索结果缓存和格式化
+
+注意：Bocha、Tavily、Brave 等接口已禁用（不稳定）
 """
 
 import logging
@@ -874,13 +876,15 @@ class BraveSearchProvider(BaseSearchProvider):
 class SearchService:
     """
     搜索服务
-    
+
     功能：
-    1. 管理多个搜索引擎
+    1. 管理搜索引擎（当前仅使用 SerpAPI）
     2. 自动故障转移
     3. 结果聚合和格式化
     4. 数据源失败时的增强搜索（股价、走势等）
     5. 港股/美股自动使用英文搜索关键词
+
+    注意：Bocha、Tavily、Brave 等其他搜索接口已禁用（不稳定）
     """
     
     # 增强搜索关键词模板（A股 中文）
@@ -912,34 +916,26 @@ class SearchService:
         初始化搜索服务
 
         Args:
-            bocha_keys: 博查搜索 API Key 列表
-            tavily_keys: Tavily API Key 列表
-            brave_keys: Brave Search API Key 列表
-            serpapi_keys: SerpAPI Key 列表
+            bocha_keys: 博查搜索 API Key 列表（已禁用）
+            tavily_keys: Tavily API Key 列表（已禁用）
+            brave_keys: Brave Search API Key 列表（已禁用）
+            serpapi_keys: SerpAPI Key 列表（唯一启用的搜索引擎）
         """
         self._providers: List[BaseSearchProvider] = []
 
-        # 初始化搜索引擎（按优先级排序）
-        # 1. Bocha 优先（中文搜索优化，AI摘要）
-        if bocha_keys:
-            self._providers.append(BochaSearchProvider(bocha_keys))
-            logger.info(f"已配置 Bocha 搜索，共 {len(bocha_keys)} 个 API Key")
+        # 初始化搜索引擎（只使用 SerpAPI）
+        # 注意：Bocha、Tavily、Brave 等其他接口已禁用（不稳定或不可用）
 
-        # 2. Tavily（免费额度更多，每月 1000 次）
-        if tavily_keys:
-            self._providers.append(TavilySearchProvider(tavily_keys))
-            logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
-
-        # 3. Brave Search（隐私优先，全球覆盖）
-        if brave_keys:
-            self._providers.append(BraveSearchProvider(brave_keys))
-            logger.info(f"已配置 Brave 搜索，共 {len(brave_keys)} 个 API Key")
-
-        # 4. SerpAPI 作为备选（每月 100 次）
+        # 只使用 SerpAPI（Google 搜索，稳定可靠）
         if serpapi_keys:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
             logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
-        
+
+        # 以下接口已禁用（根据用户要求）：
+        # - Bocha: 不稳定
+        # - Tavily: 不稳定
+        # - Brave: 不稳定
+
         if not self._providers:
             logger.warning("未配置任何搜索引擎 API Key，新闻搜索功能将不可用")
 

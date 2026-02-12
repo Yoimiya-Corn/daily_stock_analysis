@@ -165,6 +165,29 @@ export interface HistoryPagination {
   limit: number;
 }
 
+// ============ 市场推荐类型 ============
+
+/** 单只推荐股票 */
+export interface RecommendationItem {
+  name: string;
+  code: string;
+  price: number;
+  changePct: number;
+  volumeRatio: number;
+  turnoverRate: number;
+  pe: number;
+  marketCap: string;
+  reason: string;
+  change60d?: number | null;
+}
+
+/** 全市场推荐响应 */
+export interface MarketRecommendationsResponse {
+  buy: RecommendationItem[];
+  watch: RecommendationItem[];
+  updatedAt: string;
+}
+
 // ============ 错误类型 ============
 
 export interface ApiError {

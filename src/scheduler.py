@@ -56,19 +56,20 @@ class GracefulShutdown:
 class Scheduler:
     """
     定时任务调度器
-    
+
     基于 schedule 库实现，支持：
-    - 每日定时执行
+    - 每日定时执行（支持多个时间点）
     - 启动时立即执行
     - 优雅退出
     """
-    
-    def __init__(self, schedule_time: str = "18:00"):
+
+    def __init__(self, schedule_times: list = None):
         """
         初始化调度器
-        
+
         Args:
-            schedule_time: 每日执行时间，格式 "HH:MM"
+            schedule_times: 每日执行时间列表，格式 ["HH:MM", "HH:MM", ...]
+                           如果为None或空，默认为 ["18:00"]
         """
         try:
             import schedule
@@ -76,26 +77,27 @@ class Scheduler:
         except ImportError:
             logger.error("schedule 库未安装，请执行: pip install schedule")
             raise ImportError("请安装 schedule 库: pip install schedule")
-        
-        self.schedule_time = schedule_time
+
+        self.schedule_times = schedule_times if schedule_times else ["18:00"]
         self.shutdown_handler = GracefulShutdown()
-        self._task_callback: Optional[Callable] = None
+        self._task_callback = None
         self._running = False
-        
-    def set_daily_task(self, task: Callable, run_immediately: bool = True):
+
+    def set_daily_task(self, task, run_immediately: bool = True):
         """
         设置每日定时任务
-        
+
         Args:
             task: 要执行的任务函数（无参数）
             run_immediately: 是否在设置后立即执行一次
         """
         self._task_callback = task
-        
-        # 设置每日定时任务
-        self.schedule.every().day.at(self.schedule_time).do(self._safe_run_task)
-        logger.info(f"已设置每日定时任务，执行时间: {self.schedule_time}")
-        
+
+        # 为每个时间点设置定时任务
+        for time_str in self.schedule_times:
+            self.schedule.every().day.at(time_str).do(self._safe_run_task)
+            logger.info(f"已设置每日定时任务，执行时间: {time_str}")
+
         if run_immediately:
             logger.info("立即执行一次任务...")
             self._safe_run_task()
@@ -152,18 +154,20 @@ class Scheduler:
 
 def run_with_schedule(
     task: Callable,
-    schedule_time: str = "18:00",
+    schedule_times: list = None,
     run_immediately: bool = True
 ):
     """
     便捷函数：使用定时调度运行任务
-    
+
     Args:
         task: 要执行的任务函数
-        schedule_time: 每日执行时间
+        schedule_times: 每日执行时间列表，格式 ["HH:MM", ...]，默认 ["18:00"]
         run_immediately: 是否立即执行一次
     """
-    scheduler = Scheduler(schedule_time=schedule_time)
+    if schedule_times is None:
+        schedule_times = ["18:00"]
+    scheduler = Scheduler(schedule_times=schedule_times)
     scheduler.set_daily_task(task, run_immediately=run_immediately)
     scheduler.run()
 
