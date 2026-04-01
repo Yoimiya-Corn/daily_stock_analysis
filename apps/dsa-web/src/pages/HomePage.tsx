@@ -1,360 +1,325 @@
 import type React from 'react';
-import { useState, useEffect, useCallback, useRef } from 'react';
-import type { HistoryItem, AnalysisReport, TaskInfo } from '../types/analysis';
-import { historyApi } from '../api/history';
-import { analysisApi, DuplicateTaskError } from '../api/analysis';
-import { validateStockCode } from '../utils/validation';
-import { getRecentStartDate, toDateInputValue } from '../utils/format';
-import { useAnalysisStore } from '../stores/analysisStore';
-import { ReportSummary, MarketRecommendations } from '../components/report';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
+import { DashboardStateBlock } from '../components/dashboard';
+import { StockAutocomplete } from '../components/StockAutocomplete';
 import { HistoryList } from '../components/history';
+import { ReportMarkdown, ReportSummary } from '../components/report';
 import { TaskPanel } from '../components/tasks';
-import { useTaskStream } from '../hooks';
+import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
+import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
 
-/**
- * 首页 - 单页设计
- * 顶部输入 + 左侧历史 + 右侧报告
- */
 const HomePage: React.FC = () => {
-  const { setLoading, setError: setStoreError } = useAnalysisStore();
+  const navigate = useNavigate();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
-  // 输入状态
-  const [stockCode, setStockCode] = useState('');
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [inputError, setInputError] = useState<string>();
+  const {
+    query,
+    inputError,
+    duplicateError,
+    error,
+    isAnalyzing,
+    historyItems,
+    selectedHistoryIds,
+    isDeletingHistory,
+    isLoadingHistory,
+    isLoadingMore,
+    hasMore,
+    selectedReport,
+    isLoadingReport,
+    activeTasks,
+    markdownDrawerOpen,
+    setQuery,
+    clearError,
+    loadInitialHistory,
+    refreshHistory,
+    loadMoreHistory,
+    selectHistoryItem,
+    toggleHistorySelection,
+    toggleSelectAllVisible,
+    deleteSelectedHistory,
+    submitAnalysis,
+    notify,
+    setNotify,
+    syncTaskCreated,
+    syncTaskUpdated,
+    syncTaskFailed,
+    removeTask,
+    openMarkdownDrawer,
+    closeMarkdownDrawer,
+    selectedIds,
+  } = useHomeDashboardState();
 
-// 历史列表状态
-  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
-  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
-  const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const [hasMore, setHasMore] = useState(true);
-  const [currentPage, setCurrentPage] = useState(1);
-  const pageSize = 20;
-
-  // 报告详情状态
-  const [selectedReport, setSelectedReport] = useState<AnalysisReport | null>(null);
-  const [isLoadingReport, setIsLoadingReport] = useState(false);
-  const reportContainerRef = useRef<HTMLElement>(null);
-
-  // 任务队列状态
-  const [activeTasks, setActiveTasks] = useState<TaskInfo[]>([]);
-  const [duplicateError, setDuplicateError] = useState<string | null>(null);
-
-  // 用于跟踪当前分析请求，避免竞态条件
-  const analysisRequestIdRef = useRef<number>(0);
-
-  // 更新任务列表中的任务
-  const updateTask = useCallback((updatedTask: TaskInfo) => {
-    setActiveTasks((prev) => {
-      const index = prev.findIndex((t) => t.taskId === updatedTask.taskId);
-      if (index >= 0) {
-        const newTasks = [...prev];
-        newTasks[index] = updatedTask;
-        return newTasks;
-      }
-      return prev;
-    });
+  useEffect(() => {
+    document.title = '每日选股分析 - DSA';
   }, []);
+  const reportLanguage = normalizeReportLanguage(selectedReport?.meta.reportLanguage);
+  const reportText = getReportText(reportLanguage);
 
-  // 移除已完成/失败的任务
-  const removeTask = useCallback((taskId: string) => {
-    setActiveTasks((prev) => prev.filter((t) => t.taskId !== taskId));
-  }, []);
-
-  // SSE 任务流
-  useTaskStream({
-    onTaskCreated: (task) => {
-      setActiveTasks((prev) => {
-        // 避免重复添加
-        if (prev.some((t) => t.taskId === task.taskId)) return prev;
-        return [...prev, task];
-      });
-    },
-    onTaskStarted: updateTask,
-    onTaskCompleted: (task) => {
-      // 刷新历史列表
-      fetchHistory();
-      // 延迟移除任务，让用户看到完成状态
-      setTimeout(() => removeTask(task.taskId), 2000);
-    },
-    onTaskFailed: (task) => {
-      updateTask(task);
-      // 显示错误提示
-      setStoreError(task.error || '分析失败');
-      // 延迟移除任务
-      setTimeout(() => removeTask(task.taskId), 5000);
-    },
-    onError: () => {
-      console.warn('SSE 连接断开，正在重连...');
-    },
-    enabled: true,
+  useDashboardLifecycle({
+    loadInitialHistory,
+    refreshHistory,
+    syncTaskCreated,
+    syncTaskUpdated,
+    syncTaskFailed,
+    removeTask,
   });
 
-// 加载历史列表
-  const fetchHistory = useCallback(async (autoSelectFirst = false, reset = true) => {
-    if (reset) {
-      setIsLoadingHistory(true);
-      setCurrentPage(1);
-    } else {
-      setIsLoadingMore(true);
-    }
+  const handleHistoryItemClick = useCallback((recordId: number) => {
+    void selectHistoryItem(recordId);
+    setSidebarOpen(false);
+  }, [selectHistoryItem]);
 
-    const page = reset ? 1 : currentPage + 1;
-
-    try {
-      const response = await historyApi.getList({
-        startDate: getRecentStartDate(30),
-        endDate: toDateInputValue(new Date()),
-        page,
-        limit: pageSize,
+  const handleSubmitAnalysis = useCallback(
+    (
+      stockCode?: string,
+      stockName?: string,
+      selectionSource?: 'manual' | 'autocomplete' | 'import' | 'image',
+    ) => {
+      void submitAnalysis({
+        stockCode,
+        stockName,
+        originalQuery: query,
+        selectionSource: selectionSource ?? 'manual',
       });
+    },
+    [query, submitAnalysis],
+  );
 
-      // 去重：每只股票只保留最新的记录
-      const deduplicateItems = (items: HistoryItem[]) => {
-        const stockMap = new Map<string, HistoryItem>();
-        for (const item of items) {
-          const existing = stockMap.get(item.stockCode);
-          if (!existing || new Date(item.createdAt) > new Date(existing.createdAt)) {
-            stockMap.set(item.stockCode, item);
-          }
-        }
-        const result = Array.from(stockMap.values()).sort(
-          (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-        );
-        console.log('[DEBUG] Deduplicated items:', result.map(i => `${i.stockCode}-${i.queryId}`));
-        return result;
-      };
-
-      if (reset) {
-        setHistoryItems(deduplicateItems(response.items));
-      } else {
-        const combined = [...historyItems, ...response.items];
-        setHistoryItems(deduplicateItems(combined));
-      }
-
-      // 判断是否还有更多数据
-      const totalLoaded = reset ? response.items.length : historyItems.length + response.items.length;
-      setHasMore(totalLoaded < response.total);
-      setCurrentPage(page);
-
-      // 如果需要自动选择第一条，且有数据，且当前没有选中报告
-      const deduplicatedItems = reset ? deduplicateItems(response.items) : deduplicateItems([...historyItems, ...response.items]);
-      if (autoSelectFirst && deduplicatedItems.length > 0 && !selectedReport) {
-        const firstItem = deduplicatedItems[0];
-        setIsLoadingReport(true);
-        try {
-          const report = await historyApi.getDetail(firstItem.queryId);
-          setSelectedReport(report);
-        } catch (err) {
-          console.error('Failed to fetch first report:', err);
-        } finally {
-          setIsLoadingReport(false);
-        }
-      }
-    } catch (err) {
-      console.error('Failed to fetch history:', err);
-    } finally {
-      setIsLoadingHistory(false);
-      setIsLoadingMore(false);
-    }
-  }, [selectedReport, currentPage, historyItems.length, pageSize]);
-
-  // 加载更多历史记录
-  const handleLoadMore = useCallback(() => {
-    if (!isLoadingMore && hasMore) {
-      fetchHistory(false, false);
-    }
-  }, [fetchHistory, isLoadingMore, hasMore]);
-
-  // 初始加载 - 自动选择第一条
-  useEffect(() => {
-    fetchHistory(true);
-  }, []);
-
-  // 点击历史项加载报告
-  const handleHistoryClick = async (queryId: string) => {
-    console.log('[DEBUG] Clicking history item, queryId:', queryId);
-
-    // 取消当前分析请求的结果显示（通过递增 requestId）
-    analysisRequestIdRef.current += 1;
-
-    setIsLoadingReport(true);
-
-    // 滚动报告容器到顶部
-    if (reportContainerRef.current) {
-      reportContainerRef.current.scrollTop = 0;
-    }
-
-    try {
-      const report = await historyApi.getDetail(queryId);
-      console.log('[DEBUG] Loaded report for stock:', report.meta.stockCode, report.meta.stockName);
-      setSelectedReport(report);
-    } catch (err) {
-      console.error('Failed to fetch report:', err);
-      setStoreError('加载报告失败，请重试');
-    } finally {
-      setIsLoadingReport(false);
-    }
-  };
-
-  // 分析股票（异步模式）
-  const handleAnalyze = async () => {
-    const { valid, message, normalized } = validateStockCode(stockCode);
-    if (!valid) {
-      setInputError(message);
+  const handleAskFollowUp = useCallback(() => {
+    if (selectedReport?.meta.id === undefined) {
       return;
     }
 
-    setInputError(undefined);
-    setDuplicateError(null);
-    setIsAnalyzing(true);
-    setLoading(true);
-    setStoreError(null);
+    const code = selectedReport.meta.stockCode;
+    const name = selectedReport.meta.stockName;
+    const rid = selectedReport.meta.id;
+    navigate(`/chat?stock=${encodeURIComponent(code)}&name=${encodeURIComponent(name)}&recordId=${rid}`);
+  }, [navigate, selectedReport]);
 
-    // 记录当前请求的 ID
-    const currentRequestId = ++analysisRequestIdRef.current;
+  const handleDeleteSelectedHistory = useCallback(() => {
+    void deleteSelectedHistory();
+    setShowDeleteConfirm(false);
+  }, [deleteSelectedHistory]);
 
-    try {
-      // 使用异步模式提交分析
-      const response = await analysisApi.analyzeAsync({
-        stockCode: normalized,
-        reportType: 'detailed',
-      });
-
-      // 清空输入框
-      if (currentRequestId === analysisRequestIdRef.current) {
-        setStockCode('');
-      }
-
-      // 任务已提交，SSE 会推送更新
-      console.log('Task submitted:', response.taskId);
-    } catch (err) {
-      console.error('Analysis failed:', err);
-      if (currentRequestId === analysisRequestIdRef.current) {
-        if (err instanceof DuplicateTaskError) {
-          // 显示重复任务错误
-          setDuplicateError(`股票 ${err.stockCode} 正在分析中，请等待完成`);
-        } else {
-          setStoreError(err instanceof Error ? err.message : '分析失败');
-        }
-      }
-    } finally {
-      setIsAnalyzing(false);
-      setLoading(false);
-    }
-  };
-
-  // 回车提交
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && stockCode && !isAnalyzing) {
-      handleAnalyze();
-    }
-  };
+  const sidebarContent = useMemo(
+    () => (
+      <div className="flex min-h-0 h-full flex-col gap-3 overflow-hidden">
+        <TaskPanel tasks={activeTasks} />
+        <HistoryList
+          items={historyItems}
+          isLoading={isLoadingHistory}
+          isLoadingMore={isLoadingMore}
+          hasMore={hasMore}
+          selectedId={selectedReport?.meta.id}
+          selectedIds={selectedIds}
+          isDeleting={isDeletingHistory}
+          onItemClick={handleHistoryItemClick}
+          onLoadMore={() => void loadMoreHistory()}
+          onToggleItemSelection={toggleHistorySelection}
+          onToggleSelectAll={toggleSelectAllVisible}
+          onDeleteSelected={() => setShowDeleteConfirm(true)}
+          className="flex-1 overflow-hidden"
+        />
+      </div>
+    ),
+    [
+      activeTasks,
+      hasMore,
+      historyItems,
+      isDeletingHistory,
+      isLoadingHistory,
+      isLoadingMore,
+      handleHistoryItemClick,
+      loadMoreHistory,
+      selectedIds,
+      selectedReport?.meta.id,
+      toggleHistorySelection,
+      toggleSelectAllVisible,
+    ],
+  );
 
   return (
-    <div className="min-h-screen flex flex-col">
-      {/* 顶部输入栏 */}
-      <header className="flex-shrink-0 px-4 py-3 border-b border-white/5">
-        <div className="flex items-center gap-2 max-w-2xl">
-          <div className="flex-1 relative">
-            <input
-              type="text"
-              value={stockCode}
-              onChange={(e) => {
-                setStockCode(e.target.value.toUpperCase());
-                setInputError(undefined);
-              }}
-              onKeyDown={handleKeyDown}
-              placeholder="输入股票代码，如 600519、00700、AAPL"
-              disabled={isAnalyzing}
-              className={`input-terminal w-full ${inputError ? 'border-danger/50' : ''}`}
-            />
-            {inputError && (
-              <p className="absolute -bottom-4 left-0 text-xs text-danger">{inputError}</p>
-            )}
-            {duplicateError && (
-              <p className="absolute -bottom-4 left-0 text-xs text-warning">{duplicateError}</p>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={handleAnalyze}
-            disabled={!stockCode || isAnalyzing}
-            className="btn-primary flex items-center gap-1.5 whitespace-nowrap"
-          >
-            {isAnalyzing ? (
-              <>
-                <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                </svg>
-                分析中
-              </>
-            ) : (
-              '分析'
-            )}
-          </button>
-        </div>
-      </header>
-
-      {/* 主内容区 */}
-      <main className="flex-1 flex overflow-hidden p-3 gap-3">
-{/* 左侧：任务面板 + 历史列表 */}
-        <div className="flex flex-col gap-3 w-64 flex-shrink-0 overflow-hidden">
-          {/* 任务面板 */}
-          <TaskPanel tasks={activeTasks} />
-
-          {/* 历史列表 */}
-          <HistoryList
-            items={historyItems}
-            isLoading={isLoadingHistory}
-            isLoadingMore={isLoadingMore}
-            hasMore={hasMore}
-            selectedQueryId={selectedReport?.meta.queryId}
-            onItemClick={handleHistoryClick}
-            onLoadMore={handleLoadMore}
-            className="max-h-[62vh] overflow-hidden"
-          />
-        </div>
-
-        {/* 右侧报告详情 */}
-        <section ref={reportContainerRef} className="flex-1 overflow-y-auto pl-1">
-          {isLoadingReport ? (
-            <div className="flex flex-col items-center justify-center h-full">
-              <div className="w-10 h-10 border-3 border-cyan/20 border-t-cyan rounded-full animate-spin" />
-              <p className="mt-3 text-secondary text-sm">加载报告中...</p>
+    <div
+      data-testid="home-dashboard"
+      className="flex h-[calc(100vh-5rem)] w-full flex-col overflow-hidden md:flex-row sm:h-[calc(100vh-5.5rem)] lg:h-[calc(100vh-2rem)]"
+    >
+      <div className="flex-1 flex flex-col min-h-0 min-w-0 max-w-full lg:max-w-6xl mx-auto w-full">
+        <header className="flex min-w-0 flex-shrink-0 items-center overflow-hidden px-3 py-3 md:px-4 md:py-4">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2.5 md:flex-nowrap">
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="md:hidden -ml-1 flex-shrink-0 rounded-lg p-1.5 text-secondary-text transition-colors hover:bg-hover hover:text-foreground"
+              aria-label="历史记录"
+            >
+              <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+            <div className="relative min-w-0 flex-1">
+              <StockAutocomplete
+                value={query}
+                onChange={setQuery}
+                onSubmit={(stockCode, stockName, selectionSource) => {
+                  handleSubmitAnalysis(stockCode, stockName, selectionSource);
+                }}
+                placeholder="输入股票代码或名称，如 600519、贵州茅台、AAPL"
+                disabled={isAnalyzing}
+                className={inputError ? 'border-danger/50' : undefined}
+              />
             </div>
-          ) : (
-            <div className="max-w-4xl space-y-4">
-              {selectedReport ? (
+            <label className="flex h-10 flex-shrink-0 cursor-pointer items-center gap-1.5 rounded-xl border border-subtle bg-surface/60 px-3 text-xs text-secondary-text select-none transition-colors hover:border-subtle-hover hover:text-foreground">
+              <input
+                type="checkbox"
+                checked={notify}
+                onChange={(e) => setNotify(e.target.checked)}
+                className="h-3.5 w-3.5 rounded border-border accent-primary"
+              />
+              推送通知
+            </label>
+            <button
+              type="button"
+              onClick={() => handleSubmitAnalysis()}
+              disabled={!query || isAnalyzing}
+              className="btn-primary flex h-10 flex-shrink-0 items-center gap-1.5 whitespace-nowrap"
+            >
+              {isAnalyzing ? (
                 <>
-                  {/* 报告内容 */}
-                  <ReportSummary key={selectedReport.meta.queryId} data={selectedReport} isHistory />
-                  {/* 全市场推荐（常驻） */}
-                  <MarketRecommendations />
+                  <svg className="h-3.5 w-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                  </svg>
+                  分析中
                 </>
               ) : (
-                <>
-                  {/* 空状态提示 */}
-                  <div className="flex flex-col items-center justify-center py-16">
-                    <div className="w-12 h-12 mb-3 rounded-xl bg-elevated flex items-center justify-center">
-                      <svg className="w-6 h-6 text-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                      </svg>
-                    </div>
-                    <h3 className="text-base font-medium text-white mb-1.5">开始分析</h3>
-                    <p className="text-xs text-muted max-w-xs">
-                      输入股票代码进行分析，或从左侧选择历史报告查看
-                    </p>
-                  </div>
-                  {/* 全市场推荐（常驻） */}
-                  <MarketRecommendations />
-                </>
+                '分析'
               )}
+            </button>
+          </div>
+        </header>
+
+        {inputError || duplicateError ? (
+          <div className="px-3 pb-2 md:px-4">
+            {inputError ? (
+              <InlineAlert
+                variant="danger"
+                title="输入有误"
+                message={inputError}
+                className="rounded-xl px-3 py-2 text-xs shadow-none"
+              />
+            ) : null}
+            {!inputError && duplicateError ? (
+              <InlineAlert
+                variant="warning"
+                title="任务已存在"
+                message={duplicateError}
+                className="rounded-xl px-3 py-2 text-xs shadow-none"
+              />
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="flex-1 flex min-h-0 overflow-hidden">
+          <div className="hidden min-h-0 w-64 shrink-0 flex-col overflow-hidden pl-4 pb-4 md:flex lg:w-72">
+            {sidebarContent}
+          </div>
+
+          {sidebarOpen ? (
+            <div className="fixed inset-0 z-40 md:hidden" onClick={() => setSidebarOpen(false)}>
+              <div className="page-drawer-overlay absolute inset-0" />
+              <div
+                className="dashboard-card absolute bottom-0 left-0 top-0 flex w-72 flex-col overflow-hidden !rounded-none !rounded-r-xl p-3 shadow-2xl"
+                onClick={(event) => event.stopPropagation()}
+              >
+                {sidebarContent}
+              </div>
             </div>
-          )}
-        </section>
-      </main>
+          ) : null}
+
+          <section className="flex-1 min-w-0 min-h-0 overflow-x-auto overflow-y-auto px-3 pb-4 md:px-6 touch-pan-y">
+            {error ? (
+              <ApiErrorAlert
+                error={error}
+                className="mb-3"
+                onDismiss={clearError}
+              />
+            ) : null}
+            {isLoadingReport ? (
+              <div className="flex h-full flex-col items-center justify-center">
+                <DashboardStateBlock title="加载报告中..." loading />
+              </div>
+            ) : selectedReport ? (
+              <div className="max-w-4xl space-y-4 pb-8">
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <Button
+                    variant="home-action-ai"
+                    size="sm"
+                    disabled={selectedReport.meta.id === undefined}
+                    onClick={handleAskFollowUp}
+                  >
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                    </svg>
+                    追问 AI
+                  </Button>
+                  <Button
+                    variant="home-action-ai"
+                    size="sm"
+                    disabled={selectedReport.meta.id === undefined}
+                    onClick={openMarkdownDrawer}
+                  >
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    {reportText.fullReport}
+                  </Button>
+                </div>
+                <ReportSummary data={selectedReport} isHistory />
+              </div>
+            ) : (
+              <div className="flex h-full items-center justify-center">
+                <EmptyState
+                  title="开始分析"
+                  description="输入股票代码进行分析，或从左侧选择历史报告查看。"
+                  className="max-w-xl border-dashed"
+                  icon={(
+                    <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                    </svg>
+                  )}
+                />
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+
+      {markdownDrawerOpen && selectedReport?.meta.id ? (
+        <ReportMarkdown
+          recordId={selectedReport.meta.id}
+          stockName={selectedReport.meta.stockName || ''}
+          stockCode={selectedReport.meta.stockCode}
+          reportLanguage={reportLanguage}
+          onClose={closeMarkdownDrawer}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        isOpen={showDeleteConfirm}
+        title="删除历史记录"
+        message={
+          selectedHistoryIds.length === 1
+            ? '确认删除这条历史记录吗？删除后将不可恢复。'
+            : `确认删除选中的 ${selectedHistoryIds.length} 条历史记录吗？删除后将不可恢复。`
+        }
+        confirmText={isDeletingHistory ? '删除中...' : '确认删除'}
+        cancelText="取消"
+        isDanger={true}
+        onConfirm={handleDeleteSelectedHistory}
+        onCancel={() => setShowDeleteConfirm(false)}
+      />
     </div>
   );
 };

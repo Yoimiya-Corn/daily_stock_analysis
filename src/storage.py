@@ -12,6 +12,7 @@ A股自选股智能分析系统 - 存储层
 """
 
 import atexit
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
@@ -35,7 +36,10 @@ from sqlalchemy import (
     Text,
     select,
     and_,
+    or_,
+    delete,
     desc,
+    func,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -174,6 +178,31 @@ class NewsIntel(Base):
 
     def __repr__(self) -> str:
         return f"<NewsIntel(code={self.code}, title={self.title[:20]}...)>"
+
+
+class FundamentalSnapshot(Base):
+    """
+    基本面上下文快照（P0 write-only）。
+
+    仅用于写入，主链路不依赖读取该表，便于后续回测/画像扩展。
+    """
+    __tablename__ = 'fundamental_snapshot'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    query_id = Column(String(64), nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    payload = Column(Text, nullable=False)
+    source_chain = Column(Text)
+    coverage = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_fundamental_snapshot_query_code', 'query_id', 'code'),
+        Index('ix_fundamental_snapshot_created', 'created_at'),
+    )
+
+    def __repr__(self) -> str:
+        return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
 class AnalysisHistory(Base):
@@ -363,6 +392,234 @@ class BacktestSummary(Base):
     )
 
 
+class PortfolioAccount(Base):
+    """Portfolio account metadata."""
+
+    __tablename__ = 'portfolio_accounts'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(String(64), index=True)
+    name = Column(String(64), nullable=False)
+    broker = Column(String(64))
+    market = Column(String(8), nullable=False, default='cn', index=True)  # cn/hk/us
+    base_currency = Column(String(8), nullable=False, default='CNY')
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        Index('ix_portfolio_account_owner_active', 'owner_id', 'is_active'),
+    )
+
+
+class PortfolioTrade(Base):
+    """Executed trade events used as the source of truth for replay."""
+
+    __tablename__ = 'portfolio_trades'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    trade_uid = Column(String(128))
+    symbol = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn')
+    currency = Column(String(8), nullable=False, default='CNY')
+    trade_date = Column(Date, nullable=False, index=True)
+    side = Column(String(8), nullable=False)  # buy/sell
+    quantity = Column(Float, nullable=False)
+    price = Column(Float, nullable=False)
+    fee = Column(Float, default=0.0)
+    tax = Column(Float, default=0.0)
+    note = Column(String(255))
+    dedup_hash = Column(String(64), index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('account_id', 'trade_uid', name='uix_portfolio_trade_uid'),
+        UniqueConstraint('account_id', 'dedup_hash', name='uix_portfolio_trade_dedup_hash'),
+        Index('ix_portfolio_trade_account_date', 'account_id', 'trade_date'),
+    )
+
+
+class PortfolioCashLedger(Base):
+    """Cash in/out events."""
+
+    __tablename__ = 'portfolio_cash_ledger'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    event_date = Column(Date, nullable=False, index=True)
+    direction = Column(String(8), nullable=False)  # in/out
+    amount = Column(Float, nullable=False)
+    currency = Column(String(8), nullable=False, default='CNY')
+    note = Column(String(255))
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_portfolio_cash_account_date', 'account_id', 'event_date'),
+    )
+
+
+class PortfolioCorporateAction(Base):
+    """Corporate actions that impact cash or share quantity."""
+
+    __tablename__ = 'portfolio_corporate_actions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn')
+    currency = Column(String(8), nullable=False, default='CNY')
+    effective_date = Column(Date, nullable=False, index=True)
+    action_type = Column(String(24), nullable=False)  # cash_dividend/split_adjustment
+    cash_dividend_per_share = Column(Float)
+    split_ratio = Column(Float)
+    note = Column(String(255))
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_portfolio_ca_account_date', 'account_id', 'effective_date'),
+    )
+
+
+class PortfolioPosition(Base):
+    """Latest replayed position snapshot for each symbol in one account."""
+
+    __tablename__ = 'portfolio_positions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    cost_method = Column(String(8), nullable=False, default='fifo')
+    symbol = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn')
+    currency = Column(String(8), nullable=False, default='CNY')
+    quantity = Column(Float, nullable=False, default=0.0)
+    avg_cost = Column(Float, nullable=False, default=0.0)
+    total_cost = Column(Float, nullable=False, default=0.0)
+    last_price = Column(Float, nullable=False, default=0.0)
+    market_value_base = Column(Float, nullable=False, default=0.0)
+    unrealized_pnl_base = Column(Float, nullable=False, default=0.0)
+    valuation_currency = Column(String(8), nullable=False, default='CNY')
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'account_id',
+            'symbol',
+            'market',
+            'currency',
+            'cost_method',
+            name='uix_portfolio_position_account_symbol_market_currency',
+        ),
+    )
+
+
+class PortfolioPositionLot(Base):
+    """Lot-level remaining quantities used by FIFO replay."""
+
+    __tablename__ = 'portfolio_position_lots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    cost_method = Column(String(8), nullable=False, default='fifo')
+    symbol = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn')
+    currency = Column(String(8), nullable=False, default='CNY')
+    open_date = Column(Date, nullable=False, index=True)
+    remaining_quantity = Column(Float, nullable=False, default=0.0)
+    unit_cost = Column(Float, nullable=False, default=0.0)
+    source_trade_id = Column(Integer, ForeignKey('portfolio_trades.id'))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_portfolio_lot_account_symbol', 'account_id', 'symbol'),
+    )
+
+
+class PortfolioDailySnapshot(Base):
+    """Daily account snapshot generated by read-time replay."""
+
+    __tablename__ = 'portfolio_daily_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    snapshot_date = Column(Date, nullable=False, index=True)
+    cost_method = Column(String(8), nullable=False, default='fifo')  # fifo/avg
+    base_currency = Column(String(8), nullable=False, default='CNY')
+    total_cash = Column(Float, nullable=False, default=0.0)
+    total_market_value = Column(Float, nullable=False, default=0.0)
+    total_equity = Column(Float, nullable=False, default=0.0)
+    unrealized_pnl = Column(Float, nullable=False, default=0.0)
+    realized_pnl = Column(Float, nullable=False, default=0.0)
+    fee_total = Column(Float, nullable=False, default=0.0)
+    tax_total = Column(Float, nullable=False, default=0.0)
+    fx_stale = Column(Boolean, nullable=False, default=False)
+    payload = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'account_id',
+            'snapshot_date',
+            'cost_method',
+            name='uix_portfolio_snapshot_account_date_method',
+        ),
+    )
+
+
+class PortfolioFxRate(Base):
+    """Cached FX rates used for cross-currency portfolio conversion."""
+
+    __tablename__ = 'portfolio_fx_rates'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    from_currency = Column(String(8), nullable=False, index=True)
+    to_currency = Column(String(8), nullable=False, index=True)
+    rate_date = Column(Date, nullable=False, index=True)
+    rate = Column(Float, nullable=False)
+    source = Column(String(32), nullable=False, default='manual')
+    is_stale = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'from_currency',
+            'to_currency',
+            'rate_date',
+            name='uix_portfolio_fx_pair_date',
+        ),
+    )
+
+
+class ConversationMessage(Base):
+    """
+    Agent 对话历史记录表
+    """
+    __tablename__ = 'conversation_messages'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(100), index=True, nullable=False)
+    role = Column(String(20), nullable=False)  # user, assistant, system
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+
+class LLMUsage(Base):
+    """One row per litellm.completion() call — token-usage audit log."""
+
+    __tablename__ = 'llm_usage'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 'analysis' | 'agent' | 'market_review'
+    call_type = Column(String(32), nullable=False, index=True)
+    model = Column(String(128), nullable=False)
+    stock_code = Column(String(16), nullable=True)
+    prompt_tokens = Column(Integer, nullable=False, default=0)
+    completion_tokens = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)
+    called_at = Column(DateTime, default=datetime.now, index=True)
+
+
 class DatabaseManager:
     """
     数据库管理器 - 单例模式
@@ -473,6 +730,19 @@ class DatabaseManager:
         except Exception:
             session.close()
             raise
+
+    @contextmanager
+    def session_scope(self):
+        """Provide a transactional scope around a series of operations."""
+        session = self.get_session()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
     
     def has_today_data(self, code: str, target_date: Optional[date] = None) -> bool:
         """
@@ -489,6 +759,9 @@ class DatabaseManager:
         """
         if target_date is None:
             target_date = date.today()
+        # 注意：这里的 target_date 语义是“自然日”，而不是“最新交易日”。
+        # 在周末/节假日/非交易日运行时，即使数据库已有最新交易日数据，这里也会返回 False。
+        # 该行为目前保留（按需求不改逻辑）。
         
         with self.get_session() as session:
             result = session.execute(
@@ -552,6 +825,8 @@ class DatabaseManager:
             return 0
 
         saved_count = 0
+        query_ctx = query_context or {}
+        current_query_id = (query_ctx.get("query_id") or "").strip()
 
         with self.get_session() as session:
             try:
@@ -588,14 +863,30 @@ class DatabaseManager:
                         existing.fetched_at = datetime.now()
 
                         if query_context:
-                            existing.query_id = query_context.get("query_id") or existing.query_id
-                            existing.query_source = query_context.get("query_source") or existing.query_source
-                            existing.requester_platform = query_context.get("requester_platform") or existing.requester_platform
-                            existing.requester_user_id = query_context.get("requester_user_id") or existing.requester_user_id
-                            existing.requester_user_name = query_context.get("requester_user_name") or existing.requester_user_name
-                            existing.requester_chat_id = query_context.get("requester_chat_id") or existing.requester_chat_id
-                            existing.requester_message_id = query_context.get("requester_message_id") or existing.requester_message_id
-                            existing.requester_query = query_context.get("requester_query") or existing.requester_query
+                            # Keep the first query_id to avoid overwriting historical links.
+                            if not existing.query_id and current_query_id:
+                                existing.query_id = current_query_id
+                            existing.query_source = (
+                                query_context.get("query_source") or existing.query_source
+                            )
+                            existing.requester_platform = (
+                                query_context.get("requester_platform") or existing.requester_platform
+                            )
+                            existing.requester_user_id = (
+                                query_context.get("requester_user_id") or existing.requester_user_id
+                            )
+                            existing.requester_user_name = (
+                                query_context.get("requester_user_name") or existing.requester_user_name
+                            )
+                            existing.requester_chat_id = (
+                                query_context.get("requester_chat_id") or existing.requester_chat_id
+                            )
+                            existing.requester_message_id = (
+                                query_context.get("requester_message_id") or existing.requester_message_id
+                            )
+                            existing.requester_query = (
+                                query_context.get("requester_query") or existing.requester_query
+                            )
                     else:
                         try:
                             with session.begin_nested():
@@ -611,14 +902,14 @@ class DatabaseManager:
                                     source=source,
                                     published_date=published_date,
                                     fetched_at=datetime.now(),
-                                    query_id=(query_context or {}).get("query_id"),
-                                    query_source=(query_context or {}).get("query_source"),
-                                    requester_platform=(query_context or {}).get("requester_platform"),
-                                    requester_user_id=(query_context or {}).get("requester_user_id"),
-                                    requester_user_name=(query_context or {}).get("requester_user_name"),
-                                    requester_chat_id=(query_context or {}).get("requester_chat_id"),
-                                    requester_message_id=(query_context or {}).get("requester_message_id"),
-                                    requester_query=(query_context or {}).get("requester_query"),
+                                    query_id=current_query_id or None,
+                                    query_source=query_ctx.get("query_source"),
+                                    requester_platform=query_ctx.get("requester_platform"),
+                                    requester_user_id=query_ctx.get("requester_user_id"),
+                                    requester_user_name=query_ctx.get("requester_user_name"),
+                                    requester_chat_id=query_ctx.get("requester_chat_id"),
+                                    requester_message_id=query_ctx.get("requester_message_id"),
+                                    requester_query=query_ctx.get("requester_query"),
                                 )
                                 session.add(record)
                                 session.flush()
@@ -636,6 +927,86 @@ class DatabaseManager:
                 raise
 
         return saved_count
+
+    def save_fundamental_snapshot(
+        self,
+        query_id: str,
+        code: str,
+        payload: Optional[Dict[str, Any]],
+        source_chain: Optional[Any] = None,
+        coverage: Optional[Any] = None,
+    ) -> int:
+        """
+        保存基本面快照（P0 write-only）。失败不抛异常，返回写入条数 0/1。
+        """
+        if not query_id or not code or payload is None:
+            return 0
+
+        with self.get_session() as session:
+            try:
+                session.add(
+                    FundamentalSnapshot(
+                        query_id=query_id,
+                        code=code,
+                        payload=self._safe_json_dumps(payload),
+                        source_chain=self._safe_json_dumps(source_chain or []),
+                        coverage=self._safe_json_dumps(coverage or {}),
+                    )
+                )
+                session.commit()
+                return 1
+            except Exception as e:
+                session.rollback()
+                logger.debug(
+                    "基本面快照写入失败（fail-open）: query_id=%s code=%s err=%s",
+                    query_id,
+                    code,
+                    e,
+                )
+                return 0
+
+    def get_latest_fundamental_snapshot(
+        self,
+        query_id: str,
+        code: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        获取指定 query_id + code 的最新基本面快照 payload。
+
+        读取失败或不存在时返回 None（fail-open）。
+        """
+        if not query_id or not code:
+            return None
+
+        with self.get_session() as session:
+            try:
+                row = session.execute(
+                    select(FundamentalSnapshot)
+                    .where(
+                        and_(
+                            FundamentalSnapshot.query_id == query_id,
+                            FundamentalSnapshot.code == code,
+                        )
+                    )
+                    .order_by(desc(FundamentalSnapshot.created_at))
+                    .limit(1)
+                ).scalar_one_or_none()
+            except Exception as e:
+                logger.debug(
+                    "基本面快照读取失败（fail-open）: query_id=%s code=%s err=%s",
+                    query_id,
+                    code,
+                    e,
+                )
+                return None
+
+            if row is None:
+                return None
+            try:
+                payload = json.loads(row.payload or "{}")
+                return payload if isinstance(payload, dict) else None
+            except Exception:
+                return None
 
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
         """
@@ -739,19 +1110,33 @@ class DatabaseManager:
         code: Optional[str] = None,
         query_id: Optional[str] = None,
         days: int = 30,
-        limit: int = 50
+        limit: int = 50,
+        exclude_query_id: Optional[str] = None,
     ) -> List[AnalysisHistory]:
         """
-        查询分析历史记录
+        Query analysis history records.
+
+        Notes:
+        - If query_id is provided, perform exact lookup and ignore days window.
+        - If query_id is not provided, apply days-based time filtering.
+        - exclude_query_id: exclude records with this query_id (for history comparison).
         """
         cutoff_date = datetime.now() - timedelta(days=days)
 
         with self.get_session() as session:
-            conditions = [AnalysisHistory.created_at >= cutoff_date]
-            if code:
-                conditions.append(AnalysisHistory.code == code)
+            conditions = []
+
             if query_id:
                 conditions.append(AnalysisHistory.query_id == query_id)
+            else:
+                conditions.append(AnalysisHistory.created_at >= cutoff_date)
+
+            if code:
+                conditions.append(AnalysisHistory.code == code)
+
+            # exclude_query_id only applies when not doing exact lookup (query_id is None)
+            if exclude_query_id and not query_id:
+                conditions.append(AnalysisHistory.query_id != exclude_query_id)
 
             results = session.execute(
                 select(AnalysisHistory)
@@ -815,6 +1200,71 @@ class DatabaseManager:
             results = session.execute(data_query).scalars().all()
             
             return list(results), total
+    
+    def get_analysis_history_by_id(self, record_id: int) -> Optional[AnalysisHistory]:
+        """
+        根据数据库主键 ID 查询单条分析历史记录
+        
+        由于 query_id 可能重复（批量分析时多条记录共享同一 query_id），
+        使用主键 ID 确保精确查询唯一记录。
+        
+        Args:
+            record_id: 分析历史记录的主键 ID
+            
+        Returns:
+            AnalysisHistory 对象，不存在返回 None
+        """
+        with self.get_session() as session:
+            result = session.execute(
+                select(AnalysisHistory).where(AnalysisHistory.id == record_id)
+            ).scalars().first()
+            return result
+
+    def delete_analysis_history_records(self, record_ids: List[int]) -> int:
+        """
+        删除指定的分析历史记录。
+
+        同时清理依赖这些历史记录的回测结果，避免外键约束失败。
+
+        Args:
+            record_ids: 要删除的历史记录主键 ID 列表
+
+        Returns:
+            实际删除的历史记录数量
+        """
+        ids = sorted({int(record_id) for record_id in record_ids if record_id is not None})
+        if not ids:
+            return 0
+
+        with self.session_scope() as session:
+            session.execute(
+                delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(ids))
+            )
+            result = session.execute(
+                delete(AnalysisHistory).where(AnalysisHistory.id.in_(ids))
+            )
+            return result.rowcount or 0
+
+    def get_latest_analysis_by_query_id(self, query_id: str) -> Optional[AnalysisHistory]:
+        """
+        根据 query_id 查询最新一条分析历史记录
+
+        query_id 在批量分析时可能重复，故返回最近创建的一条。
+
+        Args:
+            query_id: 分析记录关联的 query_id
+
+        Returns:
+            AnalysisHistory 对象，不存在返回 None
+        """
+        with self.get_session() as session:
+            result = session.execute(
+                select(AnalysisHistory)
+                .where(AnalysisHistory.query_id == query_id)
+                .order_by(desc(AnalysisHistory.created_at))
+                .limit(1)
+            ).scalars().first()
+            return result
     
     def get_data_range(
         self, 
@@ -962,6 +1412,10 @@ class DatabaseManager:
         """
         if target_date is None:
             target_date = date.today()
+        # 注意：尽管入参提供了 target_date，但当前实现实际使用的是“最新两天数据”（get_latest_data），
+        # 并不会按 target_date 精确取当日/前一交易日的上下文。
+        # 因此若未来需要支持“按历史某天复盘/重算”的可解释性，这里需要调整。
+        # 该行为目前保留（按需求不改逻辑）。
         
         # 获取最近2天数据
         recent_data = self.get_latest_data(code, days=2)
@@ -1007,6 +1461,9 @@ class DatabaseManager:
         - 空头排列：close < ma5 < ma10 < ma20
         - 震荡整理：其他情况
         """
+        # 注意：这里的均线形态判断基于“close/ma5/ma10/ma20”静态比较，
+        # 未考虑均线拐点、斜率、或不同数据源复权口径差异。
+        # 该行为目前保留（按需求不改逻辑）。
         close = data.close or 0
         ma5 = data.ma5 or 0
         ma10 = data.ma10 or 0
@@ -1084,15 +1541,20 @@ class DatabaseManager:
     @staticmethod
     def _parse_sniper_value(value: Any) -> Optional[float]:
         """
-        解析狙击点位数值
+        Parse a sniper point value from various formats to float.
+
+        Handles: numeric types, plain number strings, Chinese price formats
+        like "18.50元", range formats like "18.50-19.00", and text with
+        embedded numbers while filtering out MA indicators.
         """
         if value is None:
             return None
         if isinstance(value, (int, float)):
-            return float(value)
+            v = float(value)
+            return v if v > 0 else None
 
-        text = str(value).replace(',', '').strip()
-        if not text:
+        text = str(value).replace(',', '').replace('，', '').strip()
+        if not text or text == '-' or text == '—' or text == 'N/A':
             return None
 
         # 尝试直接解析纯数字字符串
@@ -1122,18 +1584,58 @@ class DatabaseManager:
             
             if valid_numbers:
                 try:
-                    return float(valid_numbers[-1])
+                    return abs(float(valid_numbers[-1]))
                 except ValueError:
                     pass
+
+        # 兜底：无"元"字时，先截去第一个括号后的内容，避免误提取括号内技术指标数字
+        # 例如 "1.52-1.53 (回踩MA5/10附近)" → 仅在 "1.52-1.53 " 中搜索
+        paren_pos = len(text)
+        for paren_char in ('(', '（'):
+            pos = text.find(paren_char)
+            if pos != -1:
+                paren_pos = min(paren_pos, pos)
+        search_text = text[:paren_pos].strip() or text  # 括号前为空时降级用全文
+
+        valid_numbers = []
+        for m in re.finditer(r"\d+(?:\.\d+)?", search_text):
+            start_idx = m.start()
+            if start_idx >= 2 and search_text[start_idx-2:start_idx].upper() == "MA":
+                continue
+            valid_numbers.append(m.group())
+        if valid_numbers:
+            try:
+                return float(valid_numbers[-1])
+            except ValueError:
+                pass
         return None
 
     def _extract_sniper_points(self, result: Any) -> Dict[str, Optional[float]]:
         """
-        抽取狙击点位数据
+        Extract sniper point values from an AnalysisResult.
+
+        Tries multiple extraction paths to handle different dashboard structures:
+        1. result.get_sniper_points() (standard path)
+        2. Direct dashboard dict traversal with various nesting levels
+        3. Fallback from raw_result dict if available
         """
         raw_points = {}
+
+        # Path 1: standard method
         if hasattr(result, "get_sniper_points"):
             raw_points = result.get_sniper_points() or {}
+
+        # Path 2: direct dashboard traversal when standard path yields empty values
+        if not any(raw_points.get(k) for k in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit")):
+            dashboard = getattr(result, "dashboard", None)
+            if isinstance(dashboard, dict):
+                raw_points = self._find_sniper_in_dashboard(dashboard) or raw_points
+
+        # Path 3: try raw_result for agent mode results
+        if not any(raw_points.get(k) for k in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit")):
+            raw_response = getattr(result, "raw_response", None)
+            if isinstance(raw_response, dict):
+                raw_points = self._find_sniper_in_dashboard(raw_response) or raw_points
 
         return {
             "ideal_buy": self._parse_sniper_value(raw_points.get("ideal_buy")),
@@ -1141,6 +1643,43 @@ class DatabaseManager:
             "stop_loss": self._parse_sniper_value(raw_points.get("stop_loss")),
             "take_profit": self._parse_sniper_value(raw_points.get("take_profit")),
         }
+
+    @staticmethod
+    def _find_sniper_in_dashboard(d: dict) -> Optional[Dict[str, Any]]:
+        """
+        Recursively search for sniper_points in a dashboard dict.
+        Handles various nesting: dashboard.battle_plan.sniper_points,
+        dashboard.dashboard.battle_plan.sniper_points, etc.
+        """
+        if not isinstance(d, dict):
+            return None
+
+        # Direct: d has sniper_points keys at top level
+        if "ideal_buy" in d:
+            return d
+
+        # d.sniper_points
+        sp = d.get("sniper_points")
+        if isinstance(sp, dict) and sp:
+            return sp
+
+        # d.battle_plan.sniper_points
+        bp = d.get("battle_plan")
+        if isinstance(bp, dict):
+            sp = bp.get("sniper_points")
+            if isinstance(sp, dict) and sp:
+                return sp
+
+        # d.dashboard.battle_plan.sniper_points (double-nested)
+        inner = d.get("dashboard")
+        if isinstance(inner, dict):
+            bp = inner.get("battle_plan")
+            if isinstance(bp, dict):
+                sp = bp.get("sniper_points")
+                if isinstance(sp, dict) and sp:
+                    return sp
+
+        return None
 
     @staticmethod
     def _build_fallback_url_key(
@@ -1157,11 +1696,270 @@ class DatabaseManager:
         digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
         return f"no-url:{code}:{digest}"
 
+    def save_conversation_message(self, session_id: str, role: str, content: str) -> None:
+        """
+        保存 Agent 对话消息
+        """
+        with self.session_scope() as session:
+            msg = ConversationMessage(
+                session_id=session_id,
+                role=role,
+                content=content
+            )
+            session.add(msg)
+
+    def get_conversation_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        获取 Agent 对话历史
+        """
+        with self.session_scope() as session:
+            stmt = select(ConversationMessage).filter(
+                ConversationMessage.session_id == session_id
+            ).order_by(ConversationMessage.created_at.desc()).limit(limit)
+            messages = session.execute(stmt).scalars().all()
+
+            # 倒序返回，保证时间顺序
+            return [{"role": msg.role, "content": msg.content} for msg in reversed(messages)]
+
+    def conversation_session_exists(self, session_id: str) -> bool:
+        """Return True when at least one message exists for the given session."""
+        with self.session_scope() as session:
+            stmt = (
+                select(ConversationMessage.id)
+                .where(ConversationMessage.session_id == session_id)
+                .limit(1)
+            )
+            return session.execute(stmt).scalar() is not None
+
+    def get_chat_sessions(
+        self,
+        limit: int = 50,
+        session_prefix: Optional[str] = None,
+        extra_session_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取聊天会话列表（从 conversation_messages 聚合）
+
+        Args:
+            limit: Maximum number of sessions to return.
+            session_prefix: If provided, only return sessions whose session_id
+                starts with this prefix.  Used for per-user isolation (e.g.
+                ``"telegram_12345"``).
+            extra_session_ids: Optional exact session ids to include in
+                addition to the scoped prefix.
+
+        Returns:
+            按最近活跃时间倒序的会话列表，每条包含 session_id, title, message_count, last_active
+        """
+        from sqlalchemy import func
+
+        with self.session_scope() as session:
+            normalized_prefix = None
+            if session_prefix:
+                normalized_prefix = session_prefix if session_prefix.endswith(":") else f"{session_prefix}:"
+            exact_ids = [sid for sid in (extra_session_ids or []) if sid]
+
+            # 聚合每个 session 的消息数和最后活跃时间
+            base = (
+                select(
+                    ConversationMessage.session_id,
+                    func.count(ConversationMessage.id).label("message_count"),
+                    func.min(ConversationMessage.created_at).label("created_at"),
+                    func.max(ConversationMessage.created_at).label("last_active"),
+                )
+            )
+            conditions = []
+            if normalized_prefix:
+                conditions.append(ConversationMessage.session_id.startswith(normalized_prefix))
+            if exact_ids:
+                conditions.append(ConversationMessage.session_id.in_(exact_ids))
+            if conditions:
+                base = base.where(or_(*conditions))
+            stmt = (
+                base
+                .group_by(ConversationMessage.session_id)
+                .order_by(desc(func.max(ConversationMessage.created_at)))
+                .limit(limit)
+            )
+            rows = session.execute(stmt).all()
+
+            results = []
+            for row in rows:
+                sid = row.session_id
+                # 取该会话第一条 user 消息作为标题
+                first_user_msg = session.execute(
+                    select(ConversationMessage.content)
+                    .where(
+                        and_(
+                            ConversationMessage.session_id == sid,
+                            ConversationMessage.role == "user",
+                        )
+                    )
+                    .order_by(ConversationMessage.created_at)
+                    .limit(1)
+                ).scalar()
+                title = (first_user_msg or "新对话")[:60]
+
+                results.append({
+                    "session_id": sid,
+                    "title": title,
+                    "message_count": row.message_count,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "last_active": row.last_active.isoformat() if row.last_active else None,
+                })
+            return results
+
+    def get_conversation_messages(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        获取单个会话的完整消息列表（用于前端恢复历史）
+        """
+        with self.session_scope() as session:
+            stmt = (
+                select(ConversationMessage)
+                .where(ConversationMessage.session_id == session_id)
+                .order_by(ConversationMessage.created_at)
+                .limit(limit)
+            )
+            messages = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": str(msg.id),
+                    "role": msg.role,
+                    "content": msg.content,
+                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                }
+                for msg in messages
+            ]
+
+    def delete_conversation_session(self, session_id: str) -> int:
+        """
+        删除指定会话的所有消息
+
+        Returns:
+            删除的消息数
+        """
+        with self.session_scope() as session:
+            result = session.execute(
+                delete(ConversationMessage).where(
+                    ConversationMessage.session_id == session_id
+                )
+            )
+            return result.rowcount
+
+    # ------------------------------------------------------------------
+    # LLM usage tracking
+    # ------------------------------------------------------------------
+
+    def record_llm_usage(
+        self,
+        call_type: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        stock_code: Optional[str] = None,
+    ) -> None:
+        """Append one LLM call record to llm_usage."""
+        row = LLMUsage(
+            call_type=call_type,
+            model=model or "unknown",
+            stock_code=stock_code,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+        with self.session_scope() as session:
+            session.add(row)
+
+    def get_llm_usage_summary(
+        self,
+        from_dt: datetime,
+        to_dt: datetime,
+    ) -> Dict[str, Any]:
+        """Return aggregated token usage between from_dt and to_dt.
+
+        Returns a dict with keys:
+          total_calls, total_tokens,
+          by_call_type: list of {call_type, calls, total_tokens},
+          by_model:     list of {model, calls, total_tokens}
+        """
+        with self.session_scope() as session:
+            base_filter = and_(
+                LLMUsage.called_at >= from_dt,
+                LLMUsage.called_at <= to_dt,
+            )
+
+            # Overall totals
+            totals = session.execute(
+                select(
+                    func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
+                ).where(base_filter)
+            ).one()
+
+            # Breakdown by call_type
+            by_type_rows = session.execute(
+                select(
+                    LLMUsage.call_type,
+                    func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
+                )
+                .where(base_filter)
+                .group_by(LLMUsage.call_type)
+                .order_by(desc(func.sum(LLMUsage.total_tokens)))
+            ).all()
+
+            # Breakdown by model
+            by_model_rows = session.execute(
+                select(
+                    LLMUsage.model,
+                    func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
+                )
+                .where(base_filter)
+                .group_by(LLMUsage.model)
+                .order_by(desc(func.sum(LLMUsage.total_tokens)))
+            ).all()
+
+        return {
+            "total_calls": totals.calls,
+            "total_tokens": totals.tokens,
+            "by_call_type": [
+                {"call_type": r.call_type, "calls": r.calls, "total_tokens": r.tokens}
+                for r in by_type_rows
+            ],
+            "by_model": [
+                {"model": r.model, "calls": r.calls, "total_tokens": r.tokens}
+                for r in by_model_rows
+            ],
+        }
+
 
 # 便捷函数
 def get_db() -> DatabaseManager:
     """获取数据库管理器实例的快捷方式"""
     return DatabaseManager.get_instance()
+
+
+def persist_llm_usage(
+    usage: Dict[str, Any],
+    model: str,
+    call_type: str,
+    stock_code: Optional[str] = None,
+) -> None:
+    """Fire-and-forget: write one LLM call record to llm_usage. Never raises."""
+    try:
+        db = DatabaseManager.get_instance()
+        db.record_llm_usage(
+            call_type=call_type,
+            model=model,
+            prompt_tokens=usage.get("prompt_tokens", 0) or 0,
+            completion_tokens=usage.get("completion_tokens", 0) or 0,
+            total_tokens=usage.get("total_tokens", 0) or 0,
+            stock_code=stock_code,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning("[LLM usage] failed to persist usage record: %s", exc)
 
 
 if __name__ == "__main__":

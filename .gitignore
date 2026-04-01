@@ -47,7 +47,7 @@ env/
 .cursorrules
 
 # 数据和日志
-data/
+/data/
 logs/
 reports/
 *.db
@@ -69,12 +69,14 @@ run.sh
 
 verify_*.py
 
-# ignore claude files
-.claude/
-CLAUDE.md
+# ignore Claude workspace artifacts, but keep shared repo skills versioned
+.claude/*
+!.claude/skills/
+!.claude/skills/**
 
 # ignore static files
 static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
 .tmp/
+nul
