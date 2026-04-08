@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
+from urllib.parse import parse_qsl, unquote, urlparse
 import requests
 from newspaper import Article, Config
 from tenacity import (
@@ -212,19 +213,17 @@ class BaseSearchProvider(ABC):
         """执行搜索（子类实现）"""
         pass
     
-    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
-        """
-        执行搜索
-        
-        Args:
-            query: 搜索关键词
-            max_results: 最大返回结果数
-            days: 搜索最近几天的时间范围（默认7天）
-            
-        Returns:
-            SearchResponse 对象
-        """
-        api_key = self._get_next_key()
+    def _execute_search(
+        self,
+        query: str,
+        *,
+        max_results: int = 5,
+        days: int = 7,
+        api_key: Optional[str] = None,
+        **search_kwargs: Any,
+    ) -> SearchResponse:
+        """Run the shared search flow with an optional preselected API key."""
+        api_key = api_key or self._get_next_key()
         if not api_key:
             return SearchResponse(
                 query=query,
@@ -233,20 +232,20 @@ class BaseSearchProvider(ABC):
                 success=False,
                 error_message=f"{self._name} 未配置 API Key"
             )
-        
+
         start_time = time.time()
         try:
-            response = self._do_search(query, api_key, max_results, days=days)
+            response = self._do_search(query, api_key, max_results, days=days, **search_kwargs)
             response.search_time = time.time() - start_time
-            
+
             if response.success:
                 self._record_success(api_key)
                 logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
             else:
                 self._record_error(api_key)
-            
+
             return response
-            
+
         except Exception as e:
             self._record_error(api_key)
             elapsed = time.time() - start_time
@@ -259,6 +258,20 @@ class BaseSearchProvider(ABC):
                 error_message=str(e),
                 search_time=elapsed
             )
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        """
+        执行搜索
+        
+        Args:
+            query: 搜索关键词
+            max_results: 最大返回结果数
+            days: 搜索最近几天的时间范围（默认7天）
+            
+        Returns:
+            SearchResponse 对象
+        """
+        return self._execute_search(query, max_results=max_results, days=days)
 
 
 class TavilySearchProvider(BaseSearchProvider):
@@ -421,6 +434,46 @@ class SerpAPISearchProvider(BaseSearchProvider):
     
     文档：https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis
     """
+
+    _ORGANIC_CONTENT_FETCH_LIMIT = 1
+    _ORGANIC_CONTENT_FETCH_RANK_LIMIT = 2
+    _ORGANIC_CONTENT_FETCH_TIMEOUT = 2
+    _ORGANIC_SNIPPET_SUFFICIENT_LENGTH = 140
+    _ORGANIC_FETCHED_PREVIEW_LENGTH = 320
+    _SKIPPED_CONTENT_FETCH_SUFFIXES = (
+        ".pdf",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".svg",
+        ".webp",
+        ".zip",
+        ".rar",
+        ".7z",
+        ".doc",
+        ".docx",
+        ".ppt",
+        ".pptx",
+        ".xls",
+        ".xlsx",
+        ".csv",
+    )
+    _SKIPPED_CONTENT_FETCH_QUERY_KEYS = {
+        "attachment",
+        "attachment_file",
+        "doc",
+        "document",
+        "download",
+        "download_file",
+        "file",
+        "file_name",
+        "filename",
+        "file_path",
+        "filepath",
+        "resource",
+        "resource_file",
+    }
     
     def __init__(self, api_keys: List[str]):
         super().__init__(api_keys, "SerpAPI")
@@ -555,28 +608,33 @@ class SerpAPISearchProvider(BaseSearchProvider):
 
             # 4. 解析 Organic Results (自然搜索结果)
             organic_results = response.get('organic_results', [])
+            organic_content_fetch_attempts = 0
 
-            for item in organic_results[:max_results]:
+            for rank, item in enumerate(organic_results[:max_results]):
                 link = item.get('link', '')
-                snippet = item.get('snippet', '')
+                rich_extensions = self._extract_rich_snippet_extensions(item)
+                snippet = self._build_organic_snippet(item, rich_extensions=rich_extensions)
 
-                # 增强：如果需要，解析网页正文
-                # 策略：如果摘要太短，或者为了获取更多信息，可以请求网页
-                # 这里我们对所有结果尝试获取正文，但为了性能，仅获取前1000字符
-                content = ""
-                if link:
-                   try:
-                       fetched_content = fetch_url_content(link, timeout=5)
-                       if fetched_content:
-                           # 如果获取到了正文，将其拼接到 snippet 中，或者替换 snippet
-                           # 这里选择拼接，保留原摘要
-                           content = fetched_content
-                           if len(content) > 500:
-                               snippet = f"{snippet}\n\n【网页详情】\n{content[:500]}..."
-                           else:
-                               snippet = f"{snippet}\n\n【网页详情】\n{content}"
-                   except Exception as e:
-                       logger.debug(f"[SerpAPI] Fetch content failed: {e}")
+                if self._should_fetch_organic_content(
+                    link=link,
+                    snippet=snippet,
+                    rank=rank,
+                    fetched_count=organic_content_fetch_attempts,
+                    has_structured_summary=bool(rich_extensions),
+                ):
+                    organic_content_fetch_attempts += 1
+                    try:
+                        fetched_content = fetch_url_content(
+                            link,
+                            timeout=self._ORGANIC_CONTENT_FETCH_TIMEOUT,
+                        )
+                        if fetched_content:
+                            snippet = self._merge_organic_snippet_with_content(
+                                snippet,
+                                fetched_content,
+                            )
+                    except Exception as e:
+                        logger.debug(f"[SerpAPI] Fetch content failed: {e}")
 
                 results.append(SearchResult(
                     title=item.get('title', ''),
@@ -607,11 +665,202 @@ class SerpAPISearchProvider(BaseSearchProvider):
     def _extract_domain(url: str) -> str:
         """从 URL 提取域名"""
         try:
-            from urllib.parse import urlparse
             parsed = urlparse(url)
             return parsed.netloc.replace('www.', '') or '未知来源'
         except Exception:
             return '未知来源'
+
+    @classmethod
+    def _normalize_organic_text(cls, value: Any) -> str:
+        """标准化 SerpAPI organic 文本字段。"""
+        text = "" if value is None else str(value)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _extract_rich_snippet_extensions(cls, item: Dict[str, Any]) -> List[str]:
+        """提取 rich_snippet 中已有的结构化摘要，优先复用 API 原始返回。"""
+        rich_snippet = item.get("rich_snippet")
+        if not isinstance(rich_snippet, dict):
+            return []
+
+        extensions: List[str] = []
+        seen: set[str] = set()
+
+        for section in ("top", "bottom"):
+            section_data = rich_snippet.get(section)
+            if not isinstance(section_data, dict):
+                continue
+
+            raw_extensions = section_data.get("extensions")
+            if isinstance(raw_extensions, (list, tuple, set)):
+                for raw_value in raw_extensions:
+                    value = cls._normalize_organic_text(raw_value)
+                    if not value or value in seen:
+                        continue
+                    seen.add(value)
+                    extensions.append(value)
+
+            for raw_value in cls._flatten_rich_snippet_values(
+                section_data.get("detected_extensions")
+            ):
+                if raw_value in seen:
+                    continue
+                seen.add(raw_value)
+                extensions.append(raw_value)
+
+        return extensions
+
+    @classmethod
+    def _flatten_rich_snippet_values(
+        cls,
+        value: Any,
+        *,
+        label: Optional[str] = None,
+        allow_unlabeled_scalar: bool = False,
+    ) -> List[str]:
+        """把 rich_snippet.detected_extensions 展平为可读文本。"""
+        if isinstance(value, dict):
+            flattened: List[str] = []
+            for key, nested_value in value.items():
+                flattened.extend(
+                    cls._flatten_rich_snippet_values(
+                        nested_value,
+                        label=cls._normalize_organic_text(str(key)).replace("_", " "),
+                    )
+                )
+            return flattened
+
+        if isinstance(value, (list, tuple, set)):
+            flattened: List[str] = []
+            for nested_value in value:
+                flattened.extend(
+                    cls._flatten_rich_snippet_values(
+                        nested_value,
+                        label=label,
+                        allow_unlabeled_scalar=True,
+                    )
+                )
+            return flattened
+
+        text = cls._normalize_organic_text(value)
+        if not text:
+            return []
+
+        if label:
+            return [f"{label}: {text}"]
+
+        if allow_unlabeled_scalar:
+            return [text]
+
+        return []
+
+    @classmethod
+    def _build_organic_snippet(
+        cls,
+        item: Dict[str, Any],
+        *,
+        rich_extensions: Optional[List[str]] = None,
+    ) -> str:
+        """构建 organic result 摘要，尽量先消费 SerpAPI 已返回的信息。"""
+        snippet = cls._normalize_organic_text(item.get("snippet", ""))
+        if rich_extensions is None:
+            rich_extensions = cls._extract_rich_snippet_extensions(item)
+
+        if rich_extensions:
+            rich_text = " | ".join(rich_extensions)
+            if rich_text and rich_text not in snippet:
+                snippet = f"{snippet}\n{rich_text}".strip() if snippet else rich_text
+
+        return snippet
+
+    @classmethod
+    def _matches_skipped_content_fetch_suffix(cls, value: Any) -> bool:
+        """判断链接片段是否指向附件或其他非 HTML 资源。"""
+        normalized_value = cls._normalize_organic_text(value).lower()
+        if not normalized_value:
+            return False
+
+        decoded_value = unquote(normalized_value)
+        if decoded_value.endswith(cls._SKIPPED_CONTENT_FETCH_SUFFIXES):
+            return True
+
+        return urlparse(decoded_value).path.lower().endswith(
+            cls._SKIPPED_CONTENT_FETCH_SUFFIXES
+        )
+
+    @classmethod
+    def _matches_skipped_content_fetch_query_param(
+        cls, key: Any, value: Any
+    ) -> bool:
+        """仅对少数显式附件参数跳过正文抓取，避免误伤普通 HTML 页面。"""
+        normalized_key = cls._normalize_organic_text(key)
+        if not normalized_key:
+            return False
+
+        snake_key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized_key)
+        canonical_key = re.sub(r"[^a-z0-9]+", "_", snake_key.lower()).strip("_")
+        if canonical_key not in cls._SKIPPED_CONTENT_FETCH_QUERY_KEYS:
+            return False
+
+        return cls._matches_skipped_content_fetch_suffix(value)
+
+    @classmethod
+    def _should_fetch_organic_content(
+        cls,
+        *,
+        link: Any,
+        snippet: str,
+        rank: int,
+        fetched_count: int,
+        has_structured_summary: bool,
+    ) -> bool:
+        """仅对极少量高位且摘要明显不足的结果补抓正文。"""
+        if fetched_count >= cls._ORGANIC_CONTENT_FETCH_LIMIT:
+            return False
+
+        if rank >= cls._ORGANIC_CONTENT_FETCH_RANK_LIMIT:
+            return False
+
+        if has_structured_summary:
+            return False
+
+        if len(snippet) >= cls._ORGANIC_SNIPPET_SUFFICIENT_LENGTH:
+            return False
+
+        if not isinstance(link, str):
+            return False
+
+        if not link or not link.startswith(("http://", "https://")):
+            return False
+
+        parsed_link = urlparse(link)
+        if parsed_link.scheme not in {"http", "https"}:
+            return False
+
+        if cls._matches_skipped_content_fetch_suffix(parsed_link.path):
+            return False
+
+        for key, value in parse_qsl(parsed_link.query, keep_blank_values=True):
+            if cls._matches_skipped_content_fetch_query_param(key, value):
+                return False
+
+        return True
+
+    @classmethod
+    def _merge_organic_snippet_with_content(cls, snippet: str, content: str) -> str:
+        """用较短正文预览补强 snippet，避免拉长单次搜索耗时和返回体积。"""
+        normalized = cls._normalize_organic_text(content)
+        if not normalized:
+            return snippet
+
+        preview = normalized[:cls._ORGANIC_FETCHED_PREVIEW_LENGTH]
+        if len(normalized) > cls._ORGANIC_FETCHED_PREVIEW_LENGTH:
+            preview = f"{preview}..."
+
+        if snippet:
+            return f"{snippet}\n\n【网页详情】\n{preview}"
+
+        return f"【网页详情】\n{preview}"
 
 
 class BochaSearchProvider(BaseSearchProvider):
@@ -791,6 +1040,194 @@ class BochaSearchProvider(BaseSearchProvider):
         except Exception as e:
             error_msg = f"未知错误: {str(e)}"
             logger.error(f"[Bocha] {error_msg}")
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=error_msg
+            )
+    
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        """从 URL 提取域名作为来源"""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace('www.', '')
+            return domain or '未知来源'
+        except Exception:
+            return '未知来源'
+
+
+class AnspireSearchProvider(BaseSearchProvider):
+    """
+    Anspire Search 搜索引擎
+    
+    特点：
+    - 面向AI生态的下一代实时智能搜索引擎
+    - 结果精准、响应快速
+    - 适用于股票新闻和市场情报搜索
+    
+    文档: https://open.anspire.cn/document/docs/searchApi/
+    """
+    
+    def __init__(self, api_keys: List[str]):
+        super().__init__(api_keys, "Anspire")
+    
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        """执行 Anspire 搜索"""
+        try:
+            import requests
+        except ImportError:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="requests 未安装，请运行：pip install requests"
+            )
+        
+        try:
+            # API 端点
+            url = "https://plugin.anspire.cn/api/ntsearch/search"
+            
+            # 请求头
+            headers = {
+                'Authorization': f'Bearer {api_key}'
+            }
+
+            # 请求参数
+            payload = {
+                "query": query,
+                "top_k": min(max_results,50), 
+                "FromTime": (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"),
+                "ToTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # 执行搜索
+            response = _get_with_retry(url, headers=headers, params=payload, timeout=10)
+            
+            # 检查 HTTP 状态码
+            if response.status_code != 200:
+                # 尝试解析错误信息
+                try:
+                    if response.headers.get('content-type', '').startswith('application/json'):
+                        error_data = response.json()
+                        error_message = error_data.get('message', response.text)
+                    else:
+                        error_message = response.text
+                except Exception:
+                    error_message = response.text
+                
+                # 根据错误码处理
+                if response.status_code == 403:
+                    error_msg = f"余额不足或权限不足：{error_message}"
+                elif response.status_code == 401:
+                    error_msg = f"API KEY 无效：{error_message}"
+                elif response.status_code == 400:
+                    error_msg = f"请求参数错误：{error_message}"
+                else:
+                    error_msg = f"HTTP {response.status_code}: {error_message}"
+                
+                logger.warning(f"[Anspire] 搜索失败：{error_msg}")
+                
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=error_msg
+                )
+            
+            # 解析响应
+            try:
+                data = response.json()
+            except ValueError as e:
+                error_msg = f"响应 JSON 解析失败：{str(e)}"
+                logger.error(f"[Anspire] {error_msg}")
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=error_msg
+                )
+            
+            if 'code' in data and data.get('code') != 200:
+                error_msg = data.get('msg') or f"API 返回错误码：{data.get('code')}"
+                logger.warning(f"[Anspire] 搜索失败：{error_msg}")
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=error_msg
+                )
+            
+            if 'results' not in data:
+                error_msg = "响应中缺少 results 字段"
+                logger.error(f"[Anspire] {error_msg}，原始响应：{data}")
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=error_msg
+                )
+            
+            # 记录原始响应到日志
+            logger.info(f"[Anspire] 搜索完成，query='{query}'")
+            logger.debug(f"[Anspire] 原始响应：{data}")
+            
+            results = []
+            value_list = data.get('results', [])
+            
+            for item in value_list[:max_results]:
+                snippet = item.get('content')
+                if snippet and isinstance(snippet, str) and len(snippet) > 500:
+                    snippet = snippet[:500] + "..."
+                
+                results.append(SearchResult(
+                    title=item.get('title', ''),
+                    snippet=snippet,
+                    url=item.get('url', ''),
+                    source=self._extract_domain(item.get('url', '')),
+                    published_date=item.get('date', '')
+                ))
+            
+            logger.info(f"[Anspire] 成功解析 {len(results)} 条结果")
+            
+            return SearchResponse(
+                query=query,
+                results=results,
+                provider=self.name,
+                success=True,
+            )
+            
+        except requests.exceptions.Timeout:
+            error_msg = "请求超时"
+            logger.error(f"[Anspire] {error_msg}")
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=error_msg
+            )
+        except requests.exceptions.RequestException as e:
+            error_msg = f"网络请求失败：{str(e)}"
+            logger.error(f"[Anspire] {error_msg}")
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=error_msg
+            )
+        except Exception as e:
+            error_msg = f"未知错误：{str(e)}"
+            logger.error(f"[Anspire] {error_msg}")
             return SearchResponse(
                 query=query,
                 results=[],
@@ -1061,7 +1498,15 @@ class BraveSearchProvider(BaseSearchProvider):
     def __init__(self, api_keys: List[str]):
         super().__init__(api_keys, "Brave")
 
-    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        search_lang: Optional[str] = None,
+        country: Optional[str] = None,
+    ) -> SearchResponse:
         """执行 Brave 搜索"""
         try:
             # 请求头
@@ -1085,10 +1530,12 @@ class BraveSearchProvider(BaseSearchProvider):
                 "q": query,
                 "count": min(max_results, 20),  # Brave 最大支持20条
                 "freshness": freshness,
-                "search_lang": "en",  # 英文内容（US股票优先）
-                "country": "US",  # 美国区域偏好
                 "safesearch": "moderate"
             }
+            if search_lang:
+                params["search_lang"] = search_lang
+            if country:
+                params["country"] = country
 
             # 执行搜索（GET 请求）
             response = requests.get(
@@ -1217,6 +1664,26 @@ class BraveSearchProvider(BaseSearchProvider):
             return domain or '未知来源'
         except Exception:
             return '未知来源'
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        search_lang: Optional[str] = None,
+        country: Optional[str] = None,
+    ) -> SearchResponse:
+        """执行 Brave 搜索，可按调用方传入区域与语言偏好。"""
+        if search_lang is None and country is None:
+            return super().search(query, max_results=max_results, days=days)
+
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            search_lang=search_lang,
+            country=country,
+        )
 
 
 class SearXNGSearchProvider(BaseSearchProvider):
@@ -1651,11 +2118,14 @@ class SearchService:
     NEWS_OVERSAMPLE_FACTOR = 2
     NEWS_OVERSAMPLE_MAX = 10
     FUTURE_TOLERANCE_DAYS = 1
-    
+    _CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+    _US_STOCK_RE = re.compile(r"^[A-Za-z]{1,5}(\.[A-Za-z])?$")
+
     def __init__(
         self,
         bocha_keys: Optional[List[str]] = None,
         tavily_keys: Optional[List[str]] = None,
+        anspire_keys: Optional[List[str]] = None,
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
@@ -1670,6 +2140,7 @@ class SearchService:
         Args:
             bocha_keys: 博查搜索 API Key 列表
             tavily_keys: Tavily API Key 列表
+            anspire_keys: Anspire Search API Key 列表
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
             minimax_keys: MiniMax API Key 列表
@@ -1721,6 +2192,11 @@ class SearchService:
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
 
+        # 7. Anspire Search（实时智能搜索优化）
+        if anspire_keys:
+            self._providers.insert(0, AnspireSearchProvider(anspire_keys))
+            logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
+            
         if not self._providers:
             logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
 
@@ -1741,10 +2217,9 @@ class SearchService:
     @staticmethod
     def _is_foreign_stock(stock_code: str) -> bool:
         """判断是否为港股或美股"""
-        import re
         code = stock_code.strip()
         # 美股：1-5个大写字母，可能包含点（如 BRK.B）
-        if re.match(r'^[A-Za-z]{1,5}(\.[A-Za-z])?$', code):
+        if SearchService._US_STOCK_RE.match(code):
             return True
         # 港股：带 hk 前缀或 5位纯数字
         lower = code.lower()
@@ -1753,6 +2228,105 @@ class SearchService:
         if code.isdigit() and len(code) == 5:
             return True
         return False
+
+    @classmethod
+    def _contains_chinese_text(cls, value: Optional[str]) -> bool:
+        """Return True when the input contains CJK characters."""
+        return bool(value and cls._CHINESE_TEXT_RE.search(value))
+
+    @classmethod
+    def _is_us_stock(cls, stock_code: str) -> bool:
+        """判断是否为美股/美股指数代码。"""
+        code = (stock_code or "").strip().upper()
+        return bool(cls._US_STOCK_RE.match(code) or is_us_index_code(code))
+
+    @classmethod
+    def _should_prefer_chinese_news(
+        cls,
+        stock_code: str,
+        stock_name: str,
+        focus_keywords: Optional[List[str]] = None,
+    ) -> bool:
+        """A 股或中文名称/关键词场景下优先中文资讯。
+
+        Only returns True when there is a positive Chinese signal:
+        Chinese characters in keywords/stock_name, or a 6-digit A-stock code.
+        Avoids false positives for non-foreign but English contexts like
+        ``stock_code="market", stock_name="US market"``.
+        """
+        if any(cls._contains_chinese_text(keyword) for keyword in (focus_keywords or [])):
+            return True
+        if cls._contains_chinese_text(stock_name):
+            return True
+        # Positive A-stock identification: 6-digit numeric codes (e.g. 600519)
+        code = (stock_code or "").strip()
+        return code.isdigit() and len(code) == 6
+
+    @classmethod
+    def _is_chinese_news_result(cls, item: SearchResult) -> bool:
+        """Heuristic check for Chinese-language news items."""
+        return cls._contains_chinese_text(" ".join(filter(None, [item.title, item.snippet, item.source])))
+
+    @classmethod
+    def _prioritize_news_language(
+        cls,
+        response: SearchResponse,
+        *,
+        prefer_chinese: bool,
+    ) -> Tuple[SearchResponse, int]:
+        """Reorder results by preferred language and return preferred-result count."""
+        if not prefer_chinese or not response.success or not response.results:
+            return response, 0
+
+        chinese_results: List[SearchResult] = []
+        other_results: List[SearchResult] = []
+        for item in response.results:
+            if cls._is_chinese_news_result(item):
+                chinese_results.append(item)
+            else:
+                other_results.append(item)
+
+        return (
+            SearchResponse(
+                query=response.query,
+                results=chinese_results + other_results,
+                provider=response.provider,
+                success=response.success,
+                error_message=response.error_message,
+                search_time=response.search_time,
+            ),
+            len(chinese_results),
+        )
+
+    @classmethod
+    def _is_better_preferred_news_response(
+        cls,
+        candidate: SearchResponse,
+        *,
+        candidate_preferred_count: int,
+        best_response: Optional[SearchResponse],
+        best_preferred_count: int,
+    ) -> bool:
+        """Prefer responses with more Chinese items, then more total items."""
+        if best_response is None:
+            return True
+        if candidate_preferred_count != best_preferred_count:
+            return candidate_preferred_count > best_preferred_count
+        return len(candidate.results) > len(best_response.results)
+
+    @classmethod
+    def _brave_search_locale(
+        cls,
+        stock_code: str,
+        *,
+        prefer_chinese: bool,
+    ) -> Dict[str, str]:
+        """Resolve Brave locale hints without forcing US bias onto non-US symbols."""
+        if prefer_chinese:
+            return {"search_lang": "zh-hans", "country": "CN"}
+        if cls._is_us_stock(stock_code):
+            return {"search_lang": "en", "country": "US"}
+        return {}
 
     # A-share ETF code prefixes (Shanghai 51/52/56/58, Shenzhen 15/16/18)
     _A_ETF_PREFIXES = ('51', '52', '56', '58', '15', '16', '18')
@@ -2105,7 +2679,30 @@ class SearchService:
             error_message=response.error_message,
             search_time=response.search_time,
         )
-    
+
+    @staticmethod
+    def _limit_search_response(
+        response: SearchResponse,
+        *,
+        max_results: int,
+    ) -> SearchResponse:
+        """Trim response results without changing the rest of the metadata."""
+        if not response.success or not response.results:
+            return response
+
+        limited_results = response.results[:max_results]
+        if len(limited_results) == len(response.results):
+            return response
+
+        return SearchResponse(
+            query=response.query,
+            results=limited_results,
+            provider=response.provider,
+            success=response.success,
+            error_message=response.error_message,
+            search_time=response.search_time,
+        )
+
     def search_stock_news(
         self,
         stock_code: str,
@@ -2129,12 +2726,19 @@ class SearchService:
         # 并统一受 NEWS_MAX_AGE_DAYS 上限约束。
         search_days = self._effective_news_window_days()
         provider_max_results = self._provider_request_size(max_results)
+        prefer_chinese = self._should_prefer_chinese_news(
+            stock_code,
+            stock_name,
+            focus_keywords=focus_keywords,
+        )
 
         # 构建搜索查询（优化搜索效果）
         is_foreign = self._is_foreign_stock(stock_code)
         if focus_keywords:
             # 如果提供了关键词，直接使用关键词作为查询
             query = " ".join(focus_keywords)
+        elif prefer_chinese:
+            query = f"{stock_name} {stock_code} 股票 最新消息"
         elif is_foreign:
             # 港股/美股使用英文搜索关键词
             query = f"{stock_name} {stock_code} stock latest news"
@@ -2145,7 +2749,7 @@ class SearchService:
         logger.info(
             (
                 "搜索股票新闻: %s(%s), query='%s', 时间范围: 近%s天 "
-                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s"
+                "(profile=%s, NEWS_MAX_AGE_DAYS=%s, prefer_chinese=%s), 目标条数=%s, provider请求条数=%s"
             ),
             stock_name,
             stock_code,
@@ -2153,11 +2757,16 @@ class SearchService:
             search_days,
             self.news_strategy_profile,
             self.news_max_age_days,
+            prefer_chinese,
             max_results,
             provider_max_results,
         )
 
-        cache_key = self._cache_key(query, max_results, search_days)
+        cache_key = self._cache_key(
+            f"{query}|news_pref={'zh' if prefer_chinese else 'default'}",
+            max_results,
+            search_days,
+        )
         cached, cache_owner, cache_event = self._get_cached_or_reserve(cache_key)
         if cached is not None:
             logger.info(f"使用缓存搜索结果: {stock_name}({stock_code})")
@@ -2176,6 +2785,9 @@ class SearchService:
         try:
             # 依次尝试各个搜索引擎（若过滤后为空，继续尝试下一引擎）
             had_provider_success = False
+            fallback_response: Optional[SearchResponse] = None
+            best_preferred_response: Optional[SearchResponse] = None
+            best_preferred_count = 0
             for provider in self._providers:
                 if not provider.is_available:
                     continue
@@ -2183,20 +2795,66 @@ class SearchService:
                 search_kwargs: Dict[str, Any] = {}
                 if isinstance(provider, TavilySearchProvider):
                     search_kwargs["topic"] = "news"
+                elif isinstance(provider, BraveSearchProvider):
+                    search_kwargs.update(
+                        self._brave_search_locale(
+                            stock_code,
+                            prefer_chinese=prefer_chinese,
+                        )
+                    )
 
                 response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
-                    max_results=max_results,
+                    max_results=provider_max_results,
                     log_scope=f"{stock_code}:{provider.name}:stock_news",
                 )
                 had_provider_success = had_provider_success or bool(response.success)
 
                 if filtered_response.success and filtered_response.results:
-                    logger.info(f"使用 {provider.name} 搜索成功")
-                    self._put_cache(cache_key, filtered_response)
-                    return filtered_response
+                    prioritized_response, preferred_count = self._prioritize_news_language(
+                        filtered_response,
+                        prefer_chinese=prefer_chinese,
+                    )
+                    limited_response = self._limit_search_response(
+                        prioritized_response,
+                        max_results=max_results,
+                    )
+                    visible_preferred_count = min(preferred_count, len(limited_response.results))
+
+                    if not prefer_chinese:
+                        logger.info(f"使用 {provider.name} 搜索成功")
+                        self._put_cache(cache_key, limited_response)
+                        return limited_response
+
+                    if fallback_response is None:
+                        fallback_response = limited_response
+
+                    if visible_preferred_count > 0:
+                        logger.info(
+                            "%s 搜索成功，识别到 %s/%s 条中文新闻",
+                            provider.name,
+                            visible_preferred_count,
+                            len(limited_response.results),
+                        )
+                        if self._is_better_preferred_news_response(
+                            limited_response,
+                            candidate_preferred_count=visible_preferred_count,
+                            best_response=best_preferred_response,
+                            best_preferred_count=best_preferred_count,
+                        ):
+                            best_preferred_response = limited_response
+                            best_preferred_count = visible_preferred_count
+
+                        if visible_preferred_count >= max_results:
+                            self._put_cache(cache_key, limited_response)
+                            return limited_response
+                    else:
+                        logger.info(
+                            "%s 搜索成功但结果仍以英文为主，继续尝试下一引擎",
+                            provider.name,
+                        )
                 else:
                     if response.success and not filtered_response.results:
                         logger.info(
@@ -2209,6 +2867,12 @@ class SearchService:
                             provider.name,
                             response.error_message,
                         )
+
+            if prefer_chinese:
+                best_to_return = best_preferred_response or fallback_response
+                if best_to_return is not None:
+                    self._put_cache(cache_key, best_to_return)
+                    return best_to_return
 
             if had_provider_success:
                 return SearchResponse(
@@ -2382,6 +3046,16 @@ class SearchService:
                     'strict_freshness': not is_index_etf,
                 },
                 {
+                    'name': 'announcements',
+                    'query': (
+                        f"{stock_name} {stock_code} 公告 指数调整 成分变化"
+                        if is_index_etf else f"{stock_name} {stock_code} 公司公告 重要公告 上交所 深交所 cninfo"
+                    ),
+                    'desc': '公司公告',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
                     'name': 'earnings',
                     'query': (
                         f"{stock_name} 指数成分 净值 跟踪表现"
@@ -2495,8 +3169,17 @@ class SearchService:
         lines = [f"【{stock_name} 情报搜索结果】"]
         
         # 维度展示顺序
-        display_order = ['latest_news', 'market_analysis', 'risk_check', 'earnings', 'industry']
-        
+        display_order = ['latest_news', 'announcements', 'market_analysis', 'risk_check', 'earnings', 'industry']
+
+        dim_labels = {
+            'latest_news': '📰 最新消息',
+            'announcements': '📋 公司公告',
+            'market_analysis': '📈 机构分析',
+            'risk_check': '⚠️ 风险排查',
+            'earnings': '📊 业绩预期',
+            'industry': '🏭 行业分析',
+        }
+
         for dim_name in display_order:
             if dim_name not in intel_results:
                 continue
@@ -2504,12 +3187,7 @@ class SearchService:
             resp = intel_results[dim_name]
             
             # 获取维度描述
-            dim_desc = dim_name
-            if dim_name == 'latest_news': dim_desc = '📰 最新消息'
-            elif dim_name == 'market_analysis': dim_desc = '📈 机构分析'
-            elif dim_name == 'risk_check': dim_desc = '⚠️ 风险排查'
-            elif dim_name == 'earnings': dim_desc = '📊 业绩预期'
-            elif dim_name == 'industry': dim_desc = '🏭 行业分析'
+            dim_desc = dim_labels.get(dim_name, dim_name)
             
             lines.append(f"\n{dim_desc} (来源: {resp.provider}):")
             if resp.success and resp.results:
@@ -2751,6 +3429,7 @@ def get_search_service() -> SearchService:
                 _search_service = SearchService(
                     bocha_keys=config.bocha_api_keys,
                     tavily_keys=config.tavily_api_keys,
+                    anspire_keys=config.anspire_api_keys,
                     brave_keys=config.brave_api_keys,
                     serpapi_keys=config.serpapi_keys,
                     minimax_keys=config.minimax_api_keys,
