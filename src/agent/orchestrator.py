@@ -42,6 +42,8 @@ from src.agent.protocols import (
 )
 from src.agent.runner import parse_dashboard_json
 from src.agent.tools.registry import ToolRegistry
+from src.agent.chat_context import build_visible_chat_history
+from src.config import AGENT_MAX_STEPS_DEFAULT, get_config
 from src.report_language import normalize_report_language
 
 if TYPE_CHECKING:
@@ -83,7 +85,7 @@ class AgentOrchestrator:
         llm_adapter: LLMToolAdapter,
         skill_instructions: str = "",
         technical_skill_policy: str = "",
-        max_steps: int = 10,
+        max_steps: int = AGENT_MAX_STEPS_DEFAULT,
         mode: str = "standard",
         skill_manager=None,
         config=None,
@@ -200,15 +202,25 @@ class AgentOrchestrator:
     def _prepare_agent(self, agent: Any) -> Any:
         """Apply orchestrator-level runtime settings to a child agent.
 
-        The orchestrator-level ``max_steps`` acts as a **ceiling** — it will
-        never *increase* the per-agent limit that each specialised agent
-        already defines.  This prevents a global ``AGENT_MAX_STEPS=10``
-        from inflating a decision agent (designed for 3 steps) to 10 steps,
-        which is the primary cause of excessive LLM calls and quota
-        exhaustion in multi-agent pipelines.
+        When the orchestrator-level ``max_steps`` equals the default
+        (``AGENT_MAX_STEPS_DEFAULT``),
+        each agent keeps its own per-agent limit — this prevents inflating
+        a decision agent (designed for 3 steps) to 10 steps.
+
+        When the user **explicitly** raises the global limit above the
+        default, all agents adopt the global value so the user's intent to
+        allow more steps is respected.
+
+        When the user **lowers** the global limit below an agent's default,
+        the agent is capped at the global value.
         """
         if hasattr(agent, "max_steps"):
-            agent.max_steps = min(agent.max_steps, self.max_steps)
+            if self.max_steps > AGENT_MAX_STEPS_DEFAULT:
+                # User explicitly raised the limit — apply to all agents.
+                agent.max_steps = self.max_steps
+            else:
+                # Default or lowered — keep per-agent limit as ceiling.
+                agent.max_steps = min(agent.max_steps, self.max_steps)
         return agent
 
     def _callable_accepts_timeout_kwarg(self, func: Any) -> Optional[bool]:
@@ -304,8 +316,9 @@ class AgentOrchestrator:
         ctx.session_id = session_id
         ctx.meta["response_mode"] = "chat"
 
-        session = conversation_manager.get_or_create(session_id)
-        history = session.get_history()
+        conversation_manager.get_or_create(session_id)
+        config = self.config or getattr(self.llm_adapter, "_config", None) or get_config()
+        history = build_visible_chat_history(session_id, self.llm_adapter, config)
         if history:
             ctx.meta["conversation_history"] = history
 
@@ -507,9 +520,16 @@ class AgentOrchestrator:
             if result.success and agent.agent_name == "decision":
                 self._apply_risk_override(ctx)
 
-            # Abort pipeline on critical failure (except intel/risk — degrade gracefully)
+            # Abort pipeline on critical failure.
+            # Non-critical stages that degrade gracefully:
+            #   - intel / risk (standard support stages)
+            #   - skill agents (specialist evaluation, optional)
             if result.status == StageStatus.FAILED:
-                if agent.agent_name not in ("intel", "risk"):
+                non_critical = (
+                    agent.agent_name in ("intel", "risk")
+                    or agent.agent_name in getattr(self, "_skill_agent_names", set())
+                )
+                if not non_critical:
                     logger.error("[Orchestrator] critical stage '%s' failed: %s", agent.agent_name, result.error)
                     return OrchestratorResult(
                         success=False,
@@ -688,6 +708,8 @@ class AgentOrchestrator:
             ctx.meta["skills_requested"] = requested_skills or []
             ctx.meta["strategies_requested"] = requested_skills or []
             ctx.meta["report_language"] = normalize_report_language(context.get("report_language", "zh"))
+            if context.get("market_phase_context"):
+                ctx.meta["market_phase_context"] = context["market_phase_context"]
 
             # Pre-populate data fields that the caller already has
             for data_key in ("realtime_quote", "daily_history", "chip_distribution",

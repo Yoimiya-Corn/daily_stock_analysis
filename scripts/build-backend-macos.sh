@@ -30,6 +30,9 @@ fi
 npm run build
 popd >/dev/null
 
+log "Verifying static asset references (source)..."
+"${PYTHON_BIN}" "${SCRIPT_DIR}/check_static_assets.py" "${ROOT_DIR}/static"
+
 log "Building backend executable..."
 if ! "${PYTHON_BIN}" -m PyInstaller --version >/dev/null 2>&1; then
   "${PYTHON_BIN}" -m pip install pyinstaller
@@ -100,7 +103,7 @@ for module in "${hidden_imports[@]}"; do
 done
 
 pushd "${ROOT_DIR}" >/dev/null
-cmd=("${PYTHON_BIN}" -m PyInstaller --name stock_analysis --onedir --noconfirm --noconsole --add-data "static:static" --collect-data litellm --collect-data tiktoken)
+cmd=("${PYTHON_BIN}" -m PyInstaller --name stock_analysis --onedir --noconfirm --noconsole --add-data "static:static" --add-data "strategies:strategies" --collect-data litellm --collect-data tiktoken)
 cmd+=("${hidden_import_args[@]}" "main.py")
 
 echo "Running: ${cmd[*]}"
@@ -108,5 +111,32 @@ echo "Running: ${cmd[*]}"
 popd >/dev/null
 
 cp -R "${ROOT_DIR}/dist/stock_analysis" "${ROOT_DIR}/dist/backend/stock_analysis"
+
+log "Verifying static asset references (packaged)..."
+packaged_static="${ROOT_DIR}/dist/backend/stock_analysis/_internal/static"
+if [[ ! -d "${packaged_static}" ]]; then
+  packaged_static="${ROOT_DIR}/dist/backend/stock_analysis/static"
+fi
+if [[ -d "${packaged_static}" ]]; then
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/check_static_assets.py" "${packaged_static}"
+else
+  log "WARNING: could not locate packaged static directory under dist/backend/stock_analysis; skipping post-package check."
+fi
+
+log "Verifying packaged built-in strategies..."
+source_strategy_count="$(find "${ROOT_DIR}/strategies" -maxdepth 1 -type f -name '*.yaml' | wc -l | tr -d '[:space:]')"
+packaged_strategies="${ROOT_DIR}/dist/backend/stock_analysis/_internal/strategies"
+if [[ ! -d "${packaged_strategies}" ]]; then
+  packaged_strategies="${ROOT_DIR}/dist/backend/stock_analysis/strategies"
+fi
+if [[ ! -d "${packaged_strategies}" ]]; then
+  echo "ERROR: packaged strategies directory not found under dist/backend/stock_analysis."
+  exit 1
+fi
+packaged_strategy_count="$(find "${packaged_strategies}" -maxdepth 1 -type f -name '*.yaml' | wc -l | tr -d '[:space:]')"
+if [[ "${packaged_strategy_count}" != "${source_strategy_count}" ]]; then
+  echo "ERROR: packaged strategies count mismatch: expected ${source_strategy_count}, got ${packaged_strategy_count}."
+  exit 1
+fi
 
 log "Backend build completed."

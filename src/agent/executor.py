@@ -19,11 +19,14 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from src.config import get_config
+from src.agent.chat_context import build_visible_chat_history
 from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.runner import run_agent_loop, parse_dashboard_json
 from src.agent.tools.registry import ToolRegistry
 from src.report_language import normalize_report_language
 from src.market_context import get_market_role, get_market_guidelines
+from src.market_phase_prompt import format_market_phase_prompt_section
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +181,14 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出
 
+## 可操作性与稳定性约束
+
+- 不得仅因为单日涨跌或评分跨线就在“买入/卖出”之间剧烈切换。
+- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
+- 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
+- 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
+- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
+
 {language_section}
 """
 
@@ -305,6 +316,14 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
 3. **精确狙击点**：必须给出具体价格，不说模糊的话
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出
+
+## 可操作性与稳定性约束
+
+- 不得仅因为单日涨跌或评分跨线就在“买入/卖出”之间剧烈切换。
+- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
+- 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
+- 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
+- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
 
 {language_section}
 """
@@ -539,8 +558,9 @@ class AgentExecutor:
         tool_decls = self.tool_registry.to_openai_tools()
 
         # Get conversation history
-        session = conversation_manager.get_or_create(session_id)
-        history = session.get_history()
+        conversation_manager.get_or_create(session_id)
+        config = getattr(self.llm_adapter, "_config", None) or get_config()
+        history = build_visible_chat_history(session_id, self.llm_adapter, config)
 
         # Initialize conversation
         messages: List[Dict[str, Any]] = [
@@ -645,6 +665,13 @@ class AgentExecutor:
                 parts.append("输出语言: English（所有 JSON 键名保持不变，所有面向用户的文本值使用英文）")
             else:
                 parts.append("输出语言: 中文（所有 JSON 键名保持不变，所有面向用户的文本值使用中文）")
+
+            market_phase_section = format_market_phase_prompt_section(
+                context.get("market_phase_context"),
+                report_language=report_language,
+            )
+            if market_phase_section:
+                parts.append(market_phase_section)
 
             # Inject pre-fetched context data to avoid redundant fetches
             if context.get("realtime_quote"):
