@@ -164,6 +164,11 @@ class TushareFetcher(BaseFetcher):
             logger.warning("Tushare Token 未配置，此数据源不可用")
             return
 
+        # 检查是否为占位符 token
+        if self._is_placeholder_token(config.tushare_token):
+            logger.warning("Tushare Token 是占位符，此数据源不可用")
+            return
+
         try:
             self._api = self._build_api_client(config.tushare_token)
             logger.info("Tushare API 初始化成功")
@@ -182,6 +187,23 @@ class TushareFetcher(BaseFetcher):
         logger.debug("Tushare API client configured for direct HTTP calls")
         return client
 
+    @staticmethod
+    def _is_placeholder_token(token: str) -> bool:
+        """检测是否为占位符 token（非真实 token）"""
+        if not token:
+            return True
+        placeholder_patterns = [
+            'your_tushare_token_here',
+            'your_token_here',
+            'your_token',
+            'tushare_token',
+            'xxx',
+            'test',
+            'example',
+        ]
+        token_lower = token.strip().lower()
+        return any(p in token_lower for p in placeholder_patterns)
+
     def _determine_priority(self) -> int:
         """
         根据 Token 配置和 API 初始化状态确定优先级
@@ -196,6 +218,11 @@ class TushareFetcher(BaseFetcher):
         config = get_config()
 
         if config.tushare_token and self._api is not None:
+            # 检查是否为占位符 token
+            if self._is_placeholder_token(config.tushare_token):
+                logger.warning("⚠️ 检测到 TUSHARE_TOKEN 是占位符，跳过此数据源")
+                return 2
+
             # Token 配置且 API 初始化成功，提升为最高优先级
             logger.info("✅ 检测到 TUSHARE_TOKEN 且 API 初始化成功，Tushare 数据源优先级提升为最高 (Priority -1)")
             return -1

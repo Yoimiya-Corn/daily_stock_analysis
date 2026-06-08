@@ -16,6 +16,7 @@ BaostockFetcher - 备用数据源 2 (Priority 3)
 
 import logging
 import re
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, Generator
@@ -40,6 +41,10 @@ from .base import (
 import os
 
 logger = logging.getLogger(__name__)
+
+# Baostock 不是线程安全的：bs.login()/bs.logout() 共享进程级全局状态，
+# 多线程并发调用会导致死锁。用模块级锁串行化所有 Baostock 会话。
+_BAOSTOCK_GLOBAL_LOCK = threading.Lock()
 
 
 def _is_us_code(stock_code: str) -> bool:
@@ -93,41 +98,67 @@ class BaostockFetcher(BaseFetcher):
     @contextmanager
     def _baostock_session(self) -> Generator:
         """
-        Baostock 连接上下文管理器
-        
+        Baostock 连接上下文管理器（线程安全版）
+
+        Baostock 的 bs.login()/bs.logout() 使用进程级全局状态，不支持并发调用。
+        通过模块级锁 _BAOSTOCK_GLOBAL_LOCK 保证同一时刻只有一个线程持有会话，
+        从根本上消除多线程并发时的死锁问题。
+
         确保：
         1. 进入上下文时自动登录
         2. 退出上下文时自动登出
         3. 异常时也能正确登出
-        
+
         使用示例：
             with self._baostock_session():
                 # 在这里执行数据查询
         """
-        bs = self._get_baostock()
-        login_result = None
-        
-        try:
-            # 登录 Baostock
-            login_result = bs.login()
-            
-            if login_result.error_code != '0':
-                raise DataFetchError(f"Baostock 登录失败: {login_result.error_msg}")
-            
+        _BS_LOGIN_TIMEOUT = int(os.environ.get("BAOSTOCK_LOGIN_TIMEOUT", "15"))
+
+        with _BAOSTOCK_GLOBAL_LOCK:
+            bs = self._get_baostock()
+
+            # Run bs.login() in a daemon thread with a hard timeout.
+            # socket.setdefaulttimeout() only covers the connect phase; baostock's
+            # custom protocol may block indefinitely on recv(). A thread-based
+            # timeout is the only reliable way to enforce a deadline here.
+            _login_error: list = [None]
+            _login_result: list = [None]
+            _login_done = threading.Event()
+
+            def _do_login():
+                try:
+                    _login_result[0] = bs.login()
+                except Exception as exc:
+                    _login_error[0] = exc
+                finally:
+                    _login_done.set()
+
+            _t = threading.Thread(target=_do_login, daemon=True)
+            _t.start()
+            if not _login_done.wait(timeout=_BS_LOGIN_TIMEOUT):
+                logger.warning(f"Baostock 登录超时 ({_BS_LOGIN_TIMEOUT}s)，跳过")
+                raise DataFetchError(f"Baostock 登录超时 ({_BS_LOGIN_TIMEOUT}s)")
+
+            if _login_error[0] is not None:
+                raise DataFetchError(f"Baostock 登录异常: {_login_error[0]}") from _login_error[0]
+
+            if _login_result[0] is None or _login_result[0].error_code != '0':
+                msg = _login_result[0].error_msg if _login_result[0] else "未知错误"
+                raise DataFetchError(f"Baostock 登录失败: {msg}")
+
             logger.debug("Baostock 登录成功")
-            
-            yield bs
-            
-        finally:
-            # 确保登出，防止连接泄露
             try:
-                logout_result = bs.logout()
-                if logout_result.error_code == '0':
-                    logger.debug("Baostock 登出成功")
-                else:
-                    logger.warning(f"Baostock 登出异常: {logout_result.error_msg}")
-            except Exception as e:
-                logger.warning(f"Baostock 登出时发生错误: {e}")
+                yield bs
+            finally:
+                try:
+                    logout_result = bs.logout()
+                    if logout_result.error_code == '0':
+                        logger.debug("Baostock 登出成功")
+                    else:
+                        logger.warning(f"Baostock 登出异常: {logout_result.error_msg}")
+                except Exception as e:
+                    logger.warning(f"Baostock 登出时发生错误: {e}")
     
     def _convert_stock_code(self, stock_code: str) -> str:
         """

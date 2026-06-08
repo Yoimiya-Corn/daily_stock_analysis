@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from bot.commands.base import BotCommand
 from bot.models import BotMessage, BotResponse
 from data_provider.base import canonical_stock_code
+from data_provider.us_index_mapping import is_us_stock_code
 from src.config import get_config
 from src.storage import get_db
 
@@ -95,7 +96,7 @@ class AskCommand(BotCommand):
         normalized = code.upper()
         is_a_stock = re.match(r"^\d{6}$", normalized)
         is_hk_stock = re.match(r"^HK\d{5}$", normalized)
-        is_us_stock = re.match(r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$", normalized)
+        is_us_stock = is_us_stock_code(normalized)
 
         if not (is_a_stock or is_hk_stock or is_us_stock):
             return f"无效的股票代码: {normalized}（A股6位数字 / 港股HK+5位数字 / 美股1-5个字母）"

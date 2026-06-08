@@ -25,7 +25,7 @@ export const analysisApi = {
       stock_code: data.stockCode,
       stock_codes: data.stockCodes,
       report_type: data.reportType || 'detailed',
-      force_refresh: data.forceRefresh || false,
+      force_refresh: true, // 强制刷新
       async_mode: data.asyncMode || false,
       analysis_phase: data.analysisPhase || 'auto',
       stock_name: data.stockName,
@@ -61,7 +61,7 @@ export const analysisApi = {
       stock_code: data.stockCode,
       stock_codes: data.stockCodes,
       report_type: data.reportType || 'detailed',
-      force_refresh: data.forceRefresh || false,
+      force_refresh: true, // 强制刷新
       async_mode: true,
       analysis_phase: data.analysisPhase || 'auto',
       stock_name: data.stockName,

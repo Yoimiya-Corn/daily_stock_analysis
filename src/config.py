@@ -880,7 +880,11 @@ class Config:
     backtest_min_age_days: int = 14
     backtest_engine_version: str = "v1"
     backtest_neutral_band_pct: float = 2.0
-    
+
+    # === 数据保留 ===
+    # 自动清理超过此天数的分析历史（0=不清理）
+    data_retention_days: int = 30
+
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
     log_level: str = "INFO"  # 日志级别
@@ -1678,6 +1682,7 @@ class Config:
             backtest_enabled=os.getenv('BACKTEST_ENABLED', 'true').lower() == 'true',
             backtest_eval_window_days=parse_env_int(os.getenv('BACKTEST_EVAL_WINDOW_DAYS'), 10, field_name='BACKTEST_EVAL_WINDOW_DAYS', minimum=1),
             backtest_min_age_days=parse_env_int(os.getenv('BACKTEST_MIN_AGE_DAYS'), 14, field_name='BACKTEST_MIN_AGE_DAYS', minimum=1),
+            data_retention_days=parse_env_int(os.getenv('DATA_RETENTION_DAYS'), 30, field_name='DATA_RETENTION_DAYS', minimum=0),
             backtest_engine_version=os.getenv('BACKTEST_ENGINE_VERSION', 'v1'),
             backtest_neutral_band_pct=parse_env_float(
                 os.getenv('BACKTEST_NEUTRAL_BAND_PCT'),

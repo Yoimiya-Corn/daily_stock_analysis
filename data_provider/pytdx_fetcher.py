@@ -115,7 +115,7 @@ class PytdxFetcher(BaseFetcher):
     """
     
     name = "PytdxFetcher"
-    priority = int(os.getenv("PYTDX_PRIORITY", "2"))
+    priority = 2  # default; overridden in __init__ after dotenv is loaded
     
     # 默认通达信行情服务器列表
     DEFAULT_HOSTS = [
@@ -140,6 +140,7 @@ class PytdxFetcher(BaseFetcher):
                    PYTDX_SERVERS（ip:port,ip:port）或 PYTDX_HOST+PYTDX_PORT，
                    否则使用内置 DEFAULT_HOSTS。
         """
+        self.priority = int(os.getenv("PYTDX_PRIORITY", "2"))
         if hosts is not None:
             self._hosts = hosts
         else:

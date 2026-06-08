@@ -140,7 +140,8 @@ class HistoryService:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         page: int = 1,
-        limit: int = 20
+        limit: int = 20,
+        latest_only: bool = False
     ) -> Dict[str, Any]:
         """
         Get history analysis list.

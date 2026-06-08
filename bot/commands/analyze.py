@@ -14,6 +14,7 @@ from typing import List, Optional
 from bot.commands.base import BotCommand
 from bot.models import BotMessage, BotResponse
 from data_provider.base import canonical_stock_code
+from data_provider.us_index_mapping import is_us_stock_code
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +56,10 @@ class AnalyzeCommand(BotCommand):
         # 验证股票代码格式
         # A股：6位数字
         # 港股：HK+5位数字
-        # 美股：1-5个大写字母+.+2个后缀字母
+        # 美股：1-5个大写字母，可选.后缀（如BRK.B）
         is_a_stock = re.match(r'^\d{6}$', code)
         is_hk_stock = re.match(r'^HK\d{5}$', code)
-        is_us_stock = re.match(r'^[A-Z]{1,5}(\.[A-Z]{1,2})?$', code)
+        is_us_stock = is_us_stock_code(code)
 
         if not (is_a_stock or is_hk_stock or is_us_stock):
             return f"无效的股票代码: {code}（A股6位数字 / 港股HK+5位数字 / 美股1-5个字母）"

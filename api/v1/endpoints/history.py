@@ -87,6 +87,7 @@ def get_history_list(
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     page: int = Query(1, ge=1, description="页码（从 1 开始）"),
     limit: int = Query(20, ge=1, le=100, description="每页数量"),
+    latest_only: bool = Query(False, description="是否仅显示每只股票的最新记录"),
     db_manager: DatabaseManager = Depends(get_database_manager)
 ) -> HistoryListResponse:
     """
@@ -101,12 +102,14 @@ def get_history_list(
         end_date: 结束日期
         page: 页码
         limit: 每页数量
+        latest_only: 是否仅显示最新记录
         db_manager: 数据库管理器依赖
         
     Returns:
         HistoryListResponse: 历史记录列表
     """
     try:
+        logger.info(f"History request: code={stock_code}, start={start_date}, end={end_date}, page={page}, limit={limit}, latest={latest_only}")
         service = HistoryService(db_manager)
         
         # 使用 def 而非 async def，FastAPI 自动在线程池中执行
@@ -116,7 +119,8 @@ def get_history_list(
             start_date=start_date,
             end_date=end_date,
             page=page,
-            limit=limit
+            limit=limit,
+            latest_only=latest_only
         )
         
         # 转换为响应模型

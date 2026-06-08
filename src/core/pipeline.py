@@ -26,6 +26,7 @@ from src.config import FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT, get_config, Co
 from src.storage import get_db
 from data_provider import DataFetcherManager
 from data_provider.base import normalize_stock_code
+from data_provider.news_fetcher import NewsFetcher
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
@@ -131,6 +132,7 @@ class StockAnalysisPipeline:
         # 初始化各模块
         self.db = get_db()
         self.fetcher_manager = DataFetcherManager()
+        self.news_fetcher = NewsFetcher()  # 新闻获取器（免费源）
         # 不再单独创建 akshare_fetcher，统一使用 fetcher_manager 获取增强数据
         self.trend_analyzer = StockTrendAnalyzer()  # 技术分析器
         self.analyzer = GeminiAnalyzer(config=self.config, skills=self.analysis_skills)
@@ -457,7 +459,12 @@ class StockAnalysisPipeline:
 
                 # 格式化情报报告
                 if intel_results:
-                    news_context = self.search_service.format_intel_report(intel_results, stock_name)
+                    search_report = self.search_service.format_intel_report(intel_results, stock_name)
+                    if news_context:
+                        news_context += "--- \n### 🔍 深度情报搜索结果\n" + search_report
+                    else:
+                        news_context = search_report
+                        
                     total_results = sum(
                         len(r.results) for r in intel_results.values() if r.success
                     )
@@ -514,7 +521,7 @@ class StockAnalysisPipeline:
                     'yesterday': {}
                 }
             
-            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
+            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称、资金流向、财务数据）
             enhanced_context = self._enhance_context(
                 context, 
                 realtime_quote, 
@@ -696,7 +703,7 @@ class StockAnalysisPipeline:
         """
         增强分析上下文
         
-        将实时行情、筹码分布、趋势分析结果、股票名称添加到上下文中
+        将实时行情、筹码分布、趋势分析结果、股票名称、资金流向、财务数据添加到上下文中
         
         Args:
             context: 原始上下文
@@ -705,6 +712,8 @@ class StockAnalysisPipeline:
             trend_result: 趋势分析结果
             stock_name: 股票名称
             market_phase_context: 已构建的市场阶段上下文，用于标记盘中 partial bar
+            money_flow: 资金流向数据
+            financial_data: 财务指标数据
             
         Returns:
             增强后的上下文
@@ -1891,6 +1900,8 @@ class StockAnalysisPipeline:
             "news_content": news_content,
             "realtime_quote_raw": self._safe_to_dict(realtime_quote),
             "chip_distribution_raw": self._safe_to_dict(chip_data),
+            "money_flow_raw": enhanced_context.get('money_flow'),
+            "financial_raw": enhanced_context.get('financial'),
         }
         if news_content is not None:
             snapshot["news_retrieval_content"] = news_content
@@ -2342,7 +2353,7 @@ class StockAnalysisPipeline:
         # Issue #455: 预取股票名称，避免并发分析时显示「股票xxxxx」
         # dry_run 仅做数据拉取，不需要名称预取，避免额外网络开销
         if not dry_run:
-            self.fetcher_manager.prefetch_stock_names(stock_codes, use_bulk=False)
+            self.fetcher_manager.prefetch_stock_names(stock_codes, use_bulk=True)
 
         # 单股推送模式（#55）：从配置读取
         single_stock_notify = getattr(self.config, 'single_stock_notify', False)
@@ -2441,10 +2452,18 @@ class StockAnalysisPipeline:
         if results and not dry_run:
             self._save_local_report(results, report_type)
 
+        # 自动清理过期数据
+        if results and not dry_run:
+            self._cleanup_old_data()
+
         # 发送通知（单股推送模式下跳过汇总推送，避免重复）
         if results and send_notification and not dry_run:
-            # 运行全市场选股
-            market_recs = self.screen_market_stocks()
+            # 运行全市场选股（待实现，非阻塞）
+            try:
+                market_recs = self.screen_market_stocks()
+            except AttributeError:
+                market_recs = []
+                logger.debug("screen_market_stocks 方法未实现，跳过全市场选股")
             if single_stock_notify:
                 # 单股推送模式：只保存汇总报告，不再重复推送
                 logger.info("单股推送模式：跳过汇总推送，仅保存报告到本地")
@@ -2457,6 +2476,22 @@ class StockAnalysisPipeline:
                 self._send_notifications(results, report_type)
         
         return results
+
+    def _cleanup_old_data(self) -> None:
+        """自动清理超过保留天数的旧分析数据。"""
+        retention_days = self.config.data_retention_days
+        if retention_days <= 0:
+            return
+        try:
+            counts = self.db.cleanup_old_records(retention_days)
+            total = sum(counts.values())
+            if total > 0:
+                logger.info(
+                    f"[数据清理] 已删除 {retention_days} 天前的旧记录: "
+                    + ", ".join(f"{k}={v}" for k, v in counts.items() if v > 0)
+                )
+        except Exception as e:
+            logger.warning(f"[数据清理] 清理失败（非致命）: {e}")
 
     def _send_single_stock_notification(
         self,

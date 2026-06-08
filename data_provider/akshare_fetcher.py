@@ -94,6 +94,12 @@ _etf_realtime_cache: Dict[str, Any] = {
     'ttl': 1200  # 20分钟缓存有效期
 }
 
+# A 股名称全量缓存（get_stock_list / get_stock_name 共享）
+import threading as _threading
+_ak_name_cache: Dict[str, str] = {}
+_ak_name_cache_lock = _threading.Lock()
+_ak_name_cache_loaded: bool = False
+
 
 def _is_etf_code(stock_code: str) -> bool:
     """
@@ -139,56 +145,6 @@ def _is_hk_code(stock_code: str) -> bool:
         return numeric_part.isdigit() and 1 <= len(numeric_part) <= 5
     # 无前缀时，5位纯数字才视为港股（避免误判 A 股代码）
     return code.isdigit() and len(code) == 5
-
-
-def _normalize_tencent_volume(fields: List[str]) -> Optional[int]:
-    """
-    将腾讯实时行情成交量归一为股。
-
-    腾讯返回内容对字段 6 的公开说明和实际返回不完全一致。优先使用
-    换手率、价格、流通市值交叉校验，在原值和旧的“手转股”结果中选择
-    更接近的一方。若无法交叉校验，则保留旧的“手转股”兜底逻辑，避免
-    传统腾讯返回内容回归为原成交量的 1/100。
-    """
-    if len(fields) <= 6 or not fields[6]:
-        return None
-
-    raw_volume = safe_int(fields[6])
-    if raw_volume is None:
-        return None
-
-    price = safe_float(fields[3]) if len(fields) > 3 else None
-    turnover_rate = safe_float(fields[38]) if len(fields) > 38 else None
-    circ_mv_yi = safe_float(fields[44]) if len(fields) > 44 and fields[44] else None
-    circ_mv = circ_mv_yi * 100000000 if circ_mv_yi is not None else None
-
-    if price and price > 0 and turnover_rate and turnover_rate > 0 and circ_mv and circ_mv > 0:
-        expected_volume = (circ_mv / price) * (turnover_rate / 100)
-        if expected_volume > 0:
-            raw_delta = abs(raw_volume - expected_volume)
-            hand_to_share_volume = raw_volume * 100
-            hand_delta = abs(hand_to_share_volume - expected_volume)
-            return raw_volume if raw_delta <= hand_delta else hand_to_share_volume
-
-    return raw_volume * 100
-
-
-def _parse_tencent_amount(fields: List[str]) -> Optional[float]:
-    """
-    解析腾讯实时行情成交额，单位为元。
-
-    观测到的返回内容中，字段 35 包含更精确的“价格/成交量/成交额”
-    三元组。字段 37 是旧的“万元”口径兜底字段。
-    """
-    if len(fields) > 35 and fields[35]:
-        parts = fields[35].split("/")
-        if len(parts) >= 3:
-            precise_amount = safe_float(parts[2])
-            if precise_amount is not None:
-                return precise_amount
-
-    amount_wan = safe_float(fields[37]) if len(fields) > 37 and fields[37] else None
-    return amount_wan * 10000 if amount_wan is not None else None
 
 
 def is_hk_stock_code(stock_code: str) -> bool:
@@ -385,8 +341,8 @@ class AkshareFetcher(BaseFetcher):
     """
     
     name = "AkshareFetcher"
-    priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
-    
+    priority = 1  # 默认值；实例化时从环境变量覆盖
+
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
         """
         初始化 AkshareFetcher
@@ -399,6 +355,7 @@ class AkshareFetcher(BaseFetcher):
         self.sleep_max = sleep_max
         self._last_request_time: Optional[float] = None
         self._history_call_timeout = _AKSHARE_HISTORY_CALL_TIMEOUT
+        self.priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
         # 东财补丁开启才执行打补丁操作
         if get_config().enable_eastmoney_patch:
             eastmoney_patch()
@@ -1302,12 +1259,11 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_success(source_key)
             
             # 腾讯数据字段顺序（完整）：
-            # 1:名称 2:代码 3:最新价 4:昨收 5:今开 6:成交量 7:外盘 8:内盘
+            # 1:名称 2:代码 3:最新价 4:昨收 5:今开 6:成交量(手) 7:外盘 8:内盘
             # 9-28:买卖五档 30:时间戳 31:涨跌额 32:涨跌幅(%) 33:最高 34:最低 35:收盘/成交量/成交额
-            # 36:成交量(口径随 payload 变化) 37:成交额(万) 38:换手率(%) 39:市盈率 43:振幅(%)
+            # 36:成交量(手) 37:成交额(万) 38:换手率(%) 39:市盈率 43:振幅(%)
             # 44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
             # 使用 realtime_types.py 中的统一转换函数
-            amount = _parse_tencent_amount(fields)
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=fields[1] if len(fields) > 1 else "",
@@ -1315,8 +1271,7 @@ class AkshareFetcher(BaseFetcher):
                 price=safe_float(fields[3]),
                 change_pct=safe_float(fields[32]),
                 change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
-                volume=_normalize_tencent_volume(fields),
-                amount=amount,
+                volume=safe_int(fields[6]) * 100 if fields[6] else None,  # 腾讯返回的是手，转为股
                 open_price=safe_float(fields[5]),
                 high=safe_float(fields[33]) if len(fields) > 33 else None,  # 修正：字段 33 是最高价
                 low=safe_float(fields[34]) if len(fields) > 34 else None,  # 修正：字段 34 是最低价
@@ -1971,216 +1926,192 @@ class AkshareFetcher(BaseFetcher):
             logger.warning(f"[Akshare] 获取概念排行失败: {e}")
             return None
 
-    def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
-        """获取人气股榜，按免配置热榜数据源降级。"""
+    def fetch_money_flow(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        获取个股资金流向（主力净流入、大单占比等）
+        
+        数据来源：ak.stock_individual_fund_flow
+        """
         import akshare as ak
-
-        fetch_attempts = (
-            ("东方财富人气榜", lambda top_n: self._get_eastmoney_hot_stocks(ak, top_n)),
-            ("东方财富飙升榜", lambda top_n: self._get_eastmoney_hot_up_stocks(ak, top_n)),
-            ("雪球关注榜", lambda top_n: self._get_xueqiu_hot_stocks(ak, top_n)),
-        )
-        last_error = ""
-        for source, fetch in fetch_attempts:
-            try:
-                rows = fetch(n)
-                if rows:
-                    return rows[:n]
-            except Exception as e:
-                last_error = f"{source}: {e}"
-                logger.debug("[Akshare] 人气股候选源失败 source=%s: %s", source, e)
-        if last_error:
-            logger.warning("[Akshare] 获取人气股全部候选源失败: %s", last_error)
-        return None
-
-    def _get_eastmoney_hot_stocks(self, ak: Any, n: int = 10) -> Optional[List[Dict[str, Any]]]:
-        """获取东方财富人气股榜。"""
-        self._set_random_user_agent()
-        self._enforce_rate_limit()
-
-        logger.info("[API调用] ak.stock_hot_rank_em() 获取东方财富人气股...")
-        df = ak.stock_hot_rank_em()
-        if df is None or df.empty:
+        
+        # 美股/ETF/港股暂不支持
+        if _is_us_code(stock_code) or _is_etf_code(stock_code) or _is_hk_code(stock_code):
             return None
-
-        rows: List[Dict[str, Any]] = []
-        for _, row in df.head(n).iterrows():
-            rows.append({
-                'rank': self._safe_int(row.get('当前排名')),
-                'code': str(row.get('代码', '')).strip(),
-                'name': str(row.get('股票名称', '')).strip(),
-                'price': self._safe_float(row.get('最新价')),
-                'change_pct': self._safe_float(row.get('涨跌幅')),
-                'source': '东方财富人气榜',
-            })
-        return rows
-
-    def _get_eastmoney_hot_up_stocks(self, ak: Any, n: int = 10) -> Optional[List[Dict[str, Any]]]:
-        """获取东方财富飙升榜。"""
-        self._set_random_user_agent()
-        self._enforce_rate_limit()
-
-        logger.info("[API调用] ak.stock_hot_up_em() 获取东方财富飙升榜...")
-        df = ak.stock_hot_up_em()
-        if df is None or df.empty:
-            return None
-
-        code_col = self._find_first_column(df, ("代码", "股票代码"))
-        name_col = self._find_first_column(df, ("股票名称", "名称", "股票简称"))
-        rank_col = self._find_first_column(df, ("当前排名", "排名", "序号"))
-        price_col = self._find_first_column(df, ("最新价", "现价"))
-        change_col = self._find_column_containing(df, ("涨跌幅",))
-        if not code_col or not name_col:
-            return None
-
-        rows: List[Dict[str, Any]] = []
-        for _, row in df.head(n).iterrows():
-            rows.append({
-                'rank': self._safe_int(row.get(rank_col)) if rank_col else len(rows) + 1,
-                'code': str(row.get(code_col, '')).strip(),
-                'name': str(row.get(name_col, '')).strip(),
-                'price': self._safe_float(row.get(price_col)) if price_col else None,
-                'change_pct': self._safe_float(row.get(change_col)) if change_col else None,
-                'source': '东方财富飙升榜',
-            })
-        return rows
-
-    def _get_xueqiu_hot_stocks(self, ak: Any, n: int = 10) -> Optional[List[Dict[str, Any]]]:
-        """获取雪球关注榜兜底。该接口较慢，仅在人气榜失败后尝试。"""
-        self._set_random_user_agent()
-        self._enforce_rate_limit()
-
-        logger.info("[API调用] ak.stock_hot_follow_xq() 获取雪球关注榜...")
-        df = ak.stock_hot_follow_xq(symbol='最热门')
-        if df is None or df.empty:
-            return None
-
-        rows: List[Dict[str, Any]] = []
-        for idx, (_, row) in enumerate(df.head(n).iterrows(), 1):
-            rows.append({
-                'rank': idx,
-                'code': str(row.get('股票代码', '')).strip(),
-                'name': str(row.get('股票简称', '')).strip(),
-                'price': self._safe_float(row.get('最新价')),
-                'change_pct': None,
-                'source': '雪球关注榜',
-            })
-        return rows
-
-    def get_limit_up_pool(
-        self,
-        date: Optional[str] = None,
-        n: int = 20,
-    ) -> Optional[List[Dict[str, Any]]]:
-        """获取涨停池，优先按连板数和封板时间展示。"""
-        import akshare as ak
-
-        query_date = date or datetime.now().strftime('%Y%m%d')
+            
         try:
             self._set_random_user_agent()
             self._enforce_rate_limit()
-
-            logger.info("[API调用] ak.stock_zt_pool_em(date=%s) 获取涨停池...", query_date)
-            df = ak.stock_zt_pool_em(date=query_date)
+            
+            logger.info(f"[API调用] ak.stock_individual_fund_flow(stock={stock_code}) 获取资金流向...")
+            
+            # 市场代码转换
+            market = "sh" if stock_code.startswith(('6', '9')) else "sz"
+            if stock_code.startswith(('4', '8')): market = "bj"
+            
+            # 获取资金流向数据
+            # 东方财富接口：stock_individual_fund_flow(stock="600519", market="sh")
+            # 注意：该接口返回的是历史数据，包含日期
+            df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
+            
             if df is None or df.empty:
+                logger.warning(f"[API返回] 资金流向数据为空")
                 return None
-
-            df = df.copy()
-            for col in ('连板数', '封板资金', '成交额', '换手率', '涨跌幅'):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            if '首次封板时间' in df.columns:
-                df['首次封板时间'] = df['首次封板时间'].map(self._normalize_limit_time_value)
-                df['_首次封板时间排序'] = df['首次封板时间'].where(df['首次封板时间'] != '', '999999')
-            sort_cols = [col for col in ('连板数', '_首次封板时间排序') if col in df.columns]
-            if sort_cols:
-                ascending = [False if col == '连板数' else True for col in sort_cols]
-                df = df.sort_values(sort_cols, ascending=ascending)
-
-            rows: List[Dict[str, Any]] = []
-            for _, row in df.head(n).iterrows():
-                rows.append({
-                    'code': str(row.get('代码', '')).strip(),
-                    'name': str(row.get('名称', '')).strip(),
-                    'change_pct': self._safe_float(row.get('涨跌幅')),
-                    'price': self._safe_float(row.get('最新价')),
-                    'amount': self._safe_float(row.get('成交额')),
-                    'turnover_rate': self._safe_float(row.get('换手率')),
-                    'seal_amount': self._safe_float(row.get('封板资金')),
-                    'first_limit_time': str(row.get('首次封板时间', '')).strip(),
-                    'last_limit_time': self._normalize_limit_time_value(row.get('最后封板时间')),
-                    'break_count': self._safe_int(row.get('炸板次数')),
-                    'limit_stat': str(row.get('涨停统计', '')).strip(),
-                    'consecutive_boards': self._safe_int(row.get('连板数')),
-                    'industry': str(row.get('所属行业', '')).strip(),
-                })
-            return rows
+                
+            # 取最近一条数据
+            latest = df.iloc[0] # 通常第一条是最新的，或者需要按日期排序
+            # 检查日期列，确认排序
+            if '日期' in df.columns:
+                df['日期'] = pd.to_datetime(df['日期'])
+                df = df.sort_values('日期', ascending=False)
+                latest = df.iloc[0]
+            
+            # 构建返回结果
+            # 字段映射：主力净流入-净额, 主力净流入-净占比
+            result = {
+                'date': str(latest.get('日期', '')).split(' ')[0],
+                'main_net_inflow': safe_float(latest.get('主力净流入-净额')),
+                'main_net_inflow_ratio': safe_float(latest.get('主力净流入-净占比')),
+                'super_net_inflow': safe_float(latest.get('超大单净流入-净额')),
+                'super_net_inflow_ratio': safe_float(latest.get('超大单净流入-净占比')),
+                'large_net_inflow': safe_float(latest.get('大单净流入-净额')),
+                'large_net_inflow_ratio': safe_float(latest.get('大单净流入-净占比')),
+                'medium_net_inflow': safe_float(latest.get('中单净流入-净额')),
+                'medium_net_inflow_ratio': safe_float(latest.get('中单净流入-净占比')),
+                'small_net_inflow': safe_float(latest.get('小单净流入-净额')),
+                'small_net_inflow_ratio': safe_float(latest.get('小单净流入-净占比')),
+            }
+            
+            logger.info(f"[资金流向] {stock_code} 日期={result['date']}, 主力净流入={result['main_net_inflow']}")
+            return result
+            
         except Exception as e:
-            logger.warning(f"[Akshare] 获取涨停池失败: {e}")
+            logger.warning(f"[Akshare] 获取资金流向失败: {e}")
             return None
 
-    @staticmethod
-    def _normalize_limit_time_value(value: Any) -> str:
-        """Normalize AkShare HHMMSS-like seal time values to zero-padded HHMMSS."""
+    def fetch_financial_indicator(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        获取核心财务指标（ROE、毛利率、营收增长率等）
+        
+        数据来源：ak.stock_financial_abstract
+        """
+        import akshare as ak
+        
+        # 美股/ETF/港股暂不支持
+        if _is_us_code(stock_code) or _is_etf_code(stock_code) or _is_hk_code(stock_code):
+            return None
+            
         try:
-            if pd.isna(value):
-                return ""
-        except TypeError:
-            pass
-
-        text = str(value).strip()
-        if not text or text.lower() in {"nan", "nat", "none", "null", "-", "--"}:
-            return ""
-
-        if ":" in text:
-            parts = text.split(":")
-            try:
-                hour = int(parts[0])
-                minute = int(parts[1]) if len(parts) > 1 else 0
-                second = int(parts[2]) if len(parts) > 2 else 0
-                return f"{hour:02d}{minute:02d}{second:02d}"
-            except (TypeError, ValueError):
-                return text
-
-        try:
-            return f"{int(float(text)):06d}"
-        except (TypeError, ValueError):
-            digits = "".join(ch for ch in text if ch.isdigit())
-            return digits.zfill(6) if digits else text
-
-    @staticmethod
-    def _safe_float(value: Any) -> Optional[float]:
-        try:
-            if pd.isna(value):
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            
+            logger.info(f"[API调用] ak.stock_financial_abstract(symbol={stock_code}) 获取财务指标...")
+            
+            # 获取财务摘要数据
+            df = ak.stock_financial_abstract(symbol=stock_code)
+            
+            if df is None or df.empty:
+                logger.warning(f"[API返回] 财务指标数据为空")
                 return None
-            return float(value)
-        except (TypeError, ValueError):
+                
+            # 数据结构处理：行是指标，列是日期
+            # Columns: ['选项', '指标', '20250930', '20241231', ...]
+            # 找到最新的日期列（通常是第三列，index=2）
+            date_columns = [col for col in df.columns if col not in ['选项', '指标']]
+            if not date_columns:
+                logger.warning(f"[API返回] 财务指标数据无日期列")
+                return None
+                
+            # 简单起见，取最新的一个日期列
+            latest_date = date_columns[0]
+            
+            # 将 '指标' 列设置为索引，方便查询
+            df_indexed = df.set_index('指标')
+            
+            def get_value(indicator_name):
+                try:
+                    if indicator_name in df_indexed.index:
+                        val = df_indexed.loc[indicator_name, latest_date]
+                        # 如果有重复行，val 可能是 Series
+                        if isinstance(val, pd.Series):
+                            # 取第一个非空值
+                            val = val.dropna().iloc[0] if not val.dropna().empty else None
+                        return safe_float(val)
+                except Exception as e:
+                    # logger.debug(f"获取 {indicator_name} 失败: {e}")
+                    pass
+                return None
+
+            # 构建返回结果
+            result = {
+                'report_date': latest_date,
+                'net_profit': get_value('净利润'),
+                'revenue': get_value('营业总收入'),
+                'gross_margin': get_value('毛利率'),
+                'net_margin': get_value('销售净利率'),
+                'roe': get_value('净资产收益率(ROE)'),
+                'eps': get_value('基本每股收益'),
+                'bps': get_value('每股净资产'),
+                'liabilities_ratio': get_value('资产负债率'),
+                'revenue_growth': get_value('营业总收入增长率'),
+                'net_profit_growth': get_value('归属母公司净利润增长率'),
+            }
+            
+            # 兼容旧字段名（如果 prompt 用的是旧名）
+            result['主营业务收入增长率'] = result['revenue_growth']
+            result['净利润增长率'] = result['net_profit_growth']
+            result['净资产收益率'] = result['roe']
+            result['净利率'] = result['net_margin']
+            result['每股收益'] = result['eps']
+            result['每股净资产'] = result['bps']
+            
+            logger.info(f"[财务指标] {stock_code} 报告期={result['report_date']}, ROE={result['roe']}, 毛利率={result['gross_margin']}")
+            return result
+            
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取财务指标失败: {e}")
             return None
 
-    @staticmethod
-    def _safe_int(value: Any) -> int:
-        try:
-            if pd.isna(value):
-                return 0
-            return int(float(value))
-        except (TypeError, ValueError):
-            return 0
+    def get_stock_list(self) -> Optional[pd.DataFrame]:
+        """
+        获取全部 A 股代码与名称（模块级缓存，整个进程只调用一次）。
 
-    @staticmethod
-    def _find_first_column(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
-        columns = [str(col) for col in df.columns]
-        for candidate in candidates:
-            if candidate in columns:
-                return candidate
-        return None
+        返回 DataFrame，列：['code', 'name']，code 为 6 位纯数字代码。
+        若失败则返回 None（不应影响主流程）。
+        """
+        global _ak_name_cache, _ak_name_cache_loaded
 
-    @staticmethod
-    def _find_column_containing(df: pd.DataFrame, keywords: Tuple[str, ...]) -> Optional[str]:
-        for col in df.columns:
-            col_text = str(col)
-            if all(keyword in col_text for keyword in keywords):
-                return col
-        return None
+        if _ak_name_cache_loaded:
+            if not _ak_name_cache:
+                return None
+            df = pd.DataFrame(list(_ak_name_cache.items()), columns=['code', 'name'])
+            return df
+
+        with _ak_name_cache_lock:
+            if _ak_name_cache_loaded:
+                if not _ak_name_cache:
+                    return None
+                df = pd.DataFrame(list(_ak_name_cache.items()), columns=['code', 'name'])
+                return df
+
+            try:
+                import akshare as ak
+                logger.info("[API调用] ak.stock_info_a_code_name() 批量拉取 A 股名称列表 (~11s)…")
+                df = ak.stock_info_a_code_name()
+                if df is not None and not df.empty and 'code' in df.columns and 'name' in df.columns:
+                    _ak_name_cache.update(
+                        {str(row['code']): str(row['name']) for _, row in df.iterrows()}
+                    )
+                    logger.info(f"[股票名称] 批量加载完成，共 {len(_ak_name_cache)} 条 A 股记录")
+                else:
+                    logger.warning("[股票名称] ak.stock_info_a_code_name() 返回空数据")
+            except Exception as e:
+                logger.warning(f"[股票名称] 批量获取 A 股名称失败: {e}")
+            finally:
+                _ak_name_cache_loaded = True
+
+        if not _ak_name_cache:
+            return None
+        return pd.DataFrame(list(_ak_name_cache.items()), columns=['code', 'name'])
 
 
 if __name__ == "__main__":

@@ -3205,3 +3205,31 @@ class DataFetcherManager:
         if last_error:
             logger.warning(f"[涨停池] 所有数据源均失败，最终错误: {last_error}")
         return []
+
+    def get_money_flow(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """获取个股资金流向（自动切换数据源）。"""
+        for fetcher in self._fetchers:
+            if hasattr(fetcher, 'fetch_money_flow'):
+                try:
+                    data = fetcher.fetch_money_flow(stock_code)
+                    if data:
+                        logger.info(f"[{fetcher.name}] 获取资金流向成功")
+                        return data
+                except Exception as e:
+                    logger.warning(f"[{fetcher.name}] 获取资金流向失败: {e}")
+                    continue
+        return None
+
+    def get_financial_indicator(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """获取核心财务指标（自动切换数据源）。"""
+        for fetcher in self._fetchers:
+            if hasattr(fetcher, 'fetch_financial_indicator'):
+                try:
+                    data = fetcher.fetch_financial_indicator(stock_code)
+                    if data:
+                        logger.info(f"[{fetcher.name}] 获取财务指标成功")
+                        return data
+                except Exception as e:
+                    logger.warning(f"[{fetcher.name}] 获取财务指标失败: {e}")
+                    continue
+        return None
