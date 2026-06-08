@@ -96,6 +96,22 @@ class MainScheduleModeTestCase(unittest.TestCase):
         defaults.update(overrides)
         return _DummyConfig(**defaults)
 
+    def test_public_webui_bind_warns_when_auth_is_disabled(self) -> None:
+        with patch("src.auth.is_auth_enabled", return_value=False), \
+             patch("main.logger.warning") as warning_log:
+            main._warn_if_public_webui_without_auth("0.0.0.0")
+
+        warning_log.assert_called_once()
+        self.assertIn("WEBUI_HOST=%s", warning_log.call_args.args[0])
+        self.assertEqual(warning_log.call_args.args[1], "0.0.0.0")
+
+    def test_loopback_webui_bind_does_not_warn_when_auth_is_disabled(self) -> None:
+        with patch("src.auth.is_auth_enabled", return_value=False), \
+             patch("main.logger.warning") as warning_log:
+            main._warn_if_public_webui_without_auth("127.0.0.1")
+
+        warning_log.assert_not_called()
+
     def test_schedule_mode_ignores_cli_stock_snapshot(self) -> None:
         args = self._make_args(schedule=True, stocks="600519,000001")
         config = self._make_config(schedule_enabled=False)
@@ -482,16 +498,27 @@ class MainScheduleModeTestCase(unittest.TestCase):
         )
         pipeline = MagicMock()
         pipeline.run.return_value = []
+        events = []
+
+        def refresh_index(config_arg):
+            events.append("refresh")
+
+        def build_pipeline(*args, **kwargs):
+            events.append("pipeline")
+            return pipeline
 
         lock_token = try_acquire_market_review_lock(config)
         self.assertIsNotNone(lock_token)
         try:
-            with patch("src.core.pipeline.StockAnalysisPipeline", return_value=pipeline), \
+            with patch.object(main, "_refresh_stock_index_cache_for_analysis", side_effect=refresh_index) as refresh, \
+                 patch("src.core.pipeline.StockAnalysisPipeline", side_effect=build_pipeline), \
                  patch("src.core.market_review.run_market_review") as run_market_review:
                 main.run_full_analysis(config, args, [])
         finally:
             release_market_review_lock(lock_token)
 
+        refresh.assert_called_once_with(config)
+        self.assertEqual(events[:2], ["refresh", "pipeline"])
         pipeline.run.assert_called_once()
         run_market_review.assert_not_called()
 
