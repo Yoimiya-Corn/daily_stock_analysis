@@ -650,6 +650,7 @@ def _alphasift_dsa_daily_history_provider() -> Iterator[None]:
         lookback_days: int = 120,
         source: str = "akshare",
         retries: int = 2,
+        **kwargs: Any,
     ) -> Any:
         try:
             dsa_df, dsa_source = get_dsa_daily_history(code, lookback_days=lookback_days)
@@ -664,7 +665,7 @@ def _alphasift_dsa_daily_history_provider() -> Iterator[None]:
                 source,
                 exc,
             )
-        return original_fetch(code, lookback_days=lookback_days, source=source, retries=retries)
+        return original_fetch(code, lookback_days=lookback_days, source=source, retries=retries, **kwargs)
 
     with _ALPHASIFT_RUNTIME_ENV_LOCK:
         setattr(daily_module, "fetch_daily_history", fetch_daily_history_with_dsa)
